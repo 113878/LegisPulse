@@ -9,6 +9,7 @@ import BillFilters from "../components/bills/BillFilters";
 import BillDetailsModal from "../components/bills/BillDetailsModal";
 import BillSyncButton from "../components/bills/BillSyncButton";
 import { useToast } from "@/components/ui/use-toast";
+import { supabase } from "@/lib/supabase";
 
 export default function Dashboard() {
   const queryClient = useQueryClient();
@@ -69,10 +70,11 @@ export default function Dashboard() {
   const { data: teamBillMap = {} } = useQuery({
     queryKey: ["allTeamBills", allTeams.map((t) => t.id).join(",")],
     queryFn: async () => {
+      // Always fetch from DB — never use manual cache shortcut.
+      // An empty cached array is truthy, so `if (cached)` would silently
+      // return stale data and teammates would miss pre-existing bills.
       const entries = await Promise.all(
         allTeams.map(async (t) => {
-          const cached = queryClient.getQueryData(["teamBills", t.id]);
-          if (cached) return [t.id, cached];
           const nums = await api.entities.Team.getBillNumbers(t.id);
           queryClient.setQueryData(["teamBills", t.id], nums);
           return [t.id, nums];
@@ -82,7 +84,40 @@ export default function Dashboard() {
     },
     enabled: allTeams.length > 0,
     staleTime: 0,
+    refetchInterval: 15000,
+    refetchOnWindowFocus: true,
   });
+
+  useEffect(() => {
+    if (!allTeams.length) return;
+
+    const channels = allTeams.map((team) =>
+      supabase
+        .channel(`dashboard-team-bills-${team.id}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "team_bills",
+            filter: `team_id=eq.${team.id}`,
+          },
+          () => {
+            queryClient.invalidateQueries({ queryKey: ["teamBills", team.id] });
+            queryClient.invalidateQueries({ queryKey: ["allTeamBills"] });
+            queryClient.invalidateQueries({ queryKey: ["allTeamBillNumbers"] });
+            queryClient.invalidateQueries({ queryKey: ["sharedTeamBillData"] });
+          },
+        )
+        .subscribe(),
+    );
+
+    return () => {
+      channels.forEach((channel) => {
+        supabase.removeChannel(channel);
+      });
+    };
+  }, [allTeams, queryClient]);
 
   const teamBillMutation = useMutation({
     mutationFn: ({ teamId, action, billNumber }) =>
@@ -124,6 +159,7 @@ export default function Dashboard() {
       queryClient.invalidateQueries({
         queryKey: ["allTeamBills"],
       });
+      queryClient.invalidateQueries({ queryKey: ["allTeamBillNumbers"] });
     },
   });
 

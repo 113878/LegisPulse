@@ -116,6 +116,8 @@ export default function Layout({
     queryFn: () => api.entities.Team.getAllTeamBillNumbers(),
     enabled: !!user,
     staleTime: 60000,
+    refetchInterval: 15000,
+    refetchOnWindowFocus: true,
   });
 
   // Compute personal vs team unseen LC counts

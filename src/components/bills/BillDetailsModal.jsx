@@ -28,8 +28,8 @@ import {
   Building2,
   AlertCircle,
   ExternalLink,
-  Star,
-  StarOff,
+  Plus,
+  Check,
   Sparkles,
   BookOpen,
   Users,
@@ -37,7 +37,6 @@ import {
   AlertTriangle,
   StickyNote,
   UserCheck,
-  Check,
   ArrowRight,
   RefreshCw,
 } from "lucide-react";
@@ -466,14 +465,25 @@ export default function BillDetailsModal({
             </div>
             <div className="flex items-center gap-2">
               <Button
-                variant="ghost"
-                size="icon"
+                variant={isTracked ? "default" : "outline"}
+                size="sm"
                 onClick={() => onToggleTracking(bill.id, bill.bill_number)}
+                className={
+                  isTracked
+                    ? "bg-blue-600 hover:bg-blue-700 text-white gap-1"
+                    : "border-blue-200 text-blue-600 hover:bg-blue-50 gap-1"
+                }
               >
                 {isTracked ? (
-                  <Star className="w-5 h-5 text-yellow-500 fill-yellow-500" />
+                  <>
+                    <Check className="w-3 h-3" />
+                    Tracking
+                  </>
                 ) : (
-                  <StarOff className="w-5 h-5 text-slate-400" />
+                  <>
+                    <Plus className="w-3 h-3" />
+                    Track
+                  </>
                 )}
               </Button>
               {/* Multi-team dropdown */}

@@ -808,6 +808,20 @@ export const api = {
         return map;
       },
 
+      /**
+       * Fetch bill data for the given bill_numbers across all team members.
+       * Uses a SECURITY DEFINER RPC so the caller can read bill rows
+       * belonging to other users, but only for bills tracked in their teams.
+       */
+      async getSharedTeamBillData(billNumbers) {
+        if (!billNumbers || billNumbers.length === 0) return [];
+        const { data, error } = await supabase.rpc("get_team_bills_data", {
+          p_bill_numbers: billNumbers,
+        });
+        if (error) throw error;
+        return data ?? [];
+      },
+
       /** Update metadata on a single team bill row. `fields` can contain flag, policy_assistant, bill_summary_notes. */
       async updateBillMetadata(teamId, billNumber, fields) {
         const { error } = await supabase

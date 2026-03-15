@@ -36,6 +36,7 @@ import {
 import {
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   Plus,
   Clock,
   MapPin,
@@ -45,6 +46,7 @@ import {
   ExternalLink,
   FileText,
   Users,
+  Star,
   Eye,
   EyeOff,
 } from "lucide-react";
@@ -54,6 +56,19 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogContent,
@@ -169,6 +184,8 @@ export default function CalendarPage() {
   const [showLegislative, setShowLegislative] = useState(true);
   const [chamberFilter, setChamberFilter] = useState("all"); // all | senate | house
   const [legEventDetail, setLegEventDetail] = useState(null);
+  const [billFilter, setBillFilter] = useState("all"); // all | my | team
+  const [selectedTeamId, setSelectedTeamId] = useState(null);
   // For month view: the label shown in the header, updated by scroll
   const [scrollMonthLabel, setScrollMonthLabel] = useState(
     format(new Date(), "MMMM yyyy"),
@@ -232,11 +249,67 @@ export default function CalendarPage() {
 
   const isLoading = isLoadingUser || isLoadingLeg;
 
+  // ── Bill-tracking queries for My Bills / Team Bills filters ──
+  const { data: userData } = useQuery({
+    queryKey: ["profile"],
+    queryFn: () => api.auth.me().catch(() => null),
+  });
+  const personalTrackedBills = userData?.tracked_bill_ids ?? [];
+
+  const { data: allTeamData } = useQuery({
+    queryKey: ["allTeams"],
+    queryFn: () =>
+      api.entities.Team.getAll().catch(() => ({
+        teams: [],
+        __pendingInvites: [],
+      })),
+  });
+  const allTeams = allTeamData?.teams ?? [];
+
+  // Auto-select first team when teams load
+  useEffect(() => {
+    if (allTeams.length > 0 && !selectedTeamId) {
+      setSelectedTeamId(allTeams[0].id);
+    }
+  }, [allTeams, selectedTeamId]);
+
+  const { data: selectedTeamBillNumbers = [] } = useQuery({
+    queryKey: ["teamBills", selectedTeamId],
+    queryFn: () => api.entities.Team.getBillNumbers(selectedTeamId),
+    enabled: !!selectedTeamId,
+    staleTime: 0,
+  });
+
+  // Normalise bill identifiers for matching ("HB 123" → "HB123")
+  const normalizeBillId = useCallback(
+    (id) =>
+      String(id ?? "")
+        .replace(/\s+/g, "")
+        .toUpperCase(),
+    [],
+  );
+
+  // Build a Set of normalised bill numbers for the active filter
+  const activeBillSet = useMemo(() => {
+    if (billFilter === "my") {
+      return new Set(personalTrackedBills.map(normalizeBillId));
+    }
+    if (billFilter === "team") {
+      return new Set(selectedTeamBillNumbers.map(normalizeBillId));
+    }
+    return null; // "all" — no filtering
+  }, [
+    billFilter,
+    personalTrackedBills,
+    selectedTeamBillNumbers,
+    normalizeBillId,
+  ]);
+
   // ── Merge events ────────────────────────────────────────────
   const events = useMemo(() => {
     const merged = [...userEvents];
     if (showLegislative) {
-      const filtered =
+      let filtered =
         chamberFilter === "all"
           ? legEvents
           : legEvents.filter((ev) => {
@@ -245,6 +318,16 @@ export default function CalendarPage() {
                 ? t.startsWith("senate")
                 : t.startsWith("house");
             });
+      // Apply bill-tracking filter (My Bills / Team Bills)
+      if (activeBillSet) {
+        filtered = filtered.filter((ev) => {
+          const evBills = ev.bills ?? [];
+          if (evBills.length === 0) return false;
+          return evBills.some((b) =>
+            activeBillSet.has(normalizeBillId(b.identifier)),
+          );
+        });
+      }
       merged.push(...filtered);
     }
     // Sort by start_time
@@ -252,7 +335,14 @@ export default function CalendarPage() {
       (a, b) =>
         new Date(a.start_time).getTime() - new Date(b.start_time).getTime(),
     );
-  }, [userEvents, legEvents, showLegislative, chamberFilter]);
+  }, [
+    userEvents,
+    legEvents,
+    showLegislative,
+    chamberFilter,
+    activeBillSet,
+    normalizeBillId,
+  ]);
 
   const handleRangeExpand = useCallback((before, after) => {
     setMonthRange((prev) => {
@@ -503,6 +593,83 @@ export default function CalendarPage() {
                       {ch}
                     </button>
                   ))}
+                </div>
+              )}
+              {showLegislative && (
+                <div className="flex items-center gap-1.5">
+                  <div className="flex items-center border rounded-md overflow-hidden">
+                    {/* All Meetings */}
+                    <button
+                      onClick={() => setBillFilter("all")}
+                      className={`px-2.5 py-1 text-xs font-medium transition-colors ${
+                        billFilter === "all"
+                          ? "bg-slate-800 text-white"
+                          : "bg-white text-slate-600 hover:bg-slate-100"
+                      }`}
+                    >
+                      All Meetings
+                    </button>
+                    {/* My Bills */}
+                    <button
+                      onClick={() => setBillFilter("my")}
+                      className={`px-2.5 py-1 text-xs font-medium transition-colors ${
+                        billFilter === "my"
+                          ? "bg-yellow-500 text-white"
+                          : "bg-white text-slate-600 hover:bg-slate-100"
+                      }`}
+                    >
+                      <Star className="w-3 h-3 inline mr-0.5 -mt-0.5" />
+                      My Bills
+                    </button>
+                    {/* Team Bills – split button: left half activates filter, right half opens team picker */}
+                    <div className="flex">
+                      <button
+                        onClick={() => setBillFilter("team")}
+                        className={`px-2.5 py-1 text-xs font-medium transition-colors border-r ${
+                          billFilter === "team"
+                            ? "bg-indigo-600 text-white border-indigo-400"
+                            : "bg-white text-slate-600 hover:bg-slate-100 border-slate-200"
+                        }`}
+                      >
+                        <Users className="w-3 h-3 inline mr-0.5 -mt-0.5" />
+                        {billFilter === "team" && selectedTeamId
+                          ? (allTeams.find((t) => t.id === selectedTeamId)
+                              ?.name ?? "Team Bills")
+                          : "Team Bills"}
+                      </button>
+                      {allTeams.length > 0 && (
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <button
+                              className={`px-1.5 py-1 text-xs font-medium transition-colors ${
+                                billFilter === "team"
+                                  ? "bg-indigo-600 text-white hover:bg-indigo-700"
+                                  : "bg-white text-slate-600 hover:bg-slate-100"
+                              }`}
+                            >
+                              <ChevronDown className="w-3 h-3" />
+                            </button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end" className="text-xs">
+                            {allTeams.map((t) => (
+                              <DropdownMenuItem
+                                key={t.id}
+                                className={`text-xs cursor-pointer ${
+                                  selectedTeamId === t.id ? "font-semibold" : ""
+                                }`}
+                                onClick={() => {
+                                  setSelectedTeamId(t.id);
+                                  setBillFilter("team");
+                                }}
+                              >
+                                {t.name}
+                              </DropdownMenuItem>
+                            ))}
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      )}
+                    </div>
+                  </div>
                 </div>
               )}
               <Button
