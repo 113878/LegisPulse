@@ -6,7 +6,12 @@ import {
   useEffect,
   useLayoutEffect,
 } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  useQuery,
+  useQueries,
+  useMutation,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { api } from "@/api/apiClient";
 import { fetchGAEvents } from "@/services/openstates";
 import { useToast } from "@/components/ui/use-toast";
@@ -49,6 +54,7 @@ import {
   Star,
   Eye,
   EyeOff,
+  Video,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -184,7 +190,7 @@ export default function CalendarPage() {
   const [showLegislative, setShowLegislative] = useState(true);
   const [chamberFilter, setChamberFilter] = useState("all"); // all | senate | house
   const [legEventDetail, setLegEventDetail] = useState(null);
-  const [billFilter, setBillFilter] = useState("all"); // all | my | team
+  const [billFilter, setBillFilter] = useState("all"); // all | my | team | allTeams
   const [selectedTeamId, setSelectedTeamId] = useState(null);
   // For month view: the label shown in the header, updated by scroll
   const [scrollMonthLabel, setScrollMonthLabel] = useState(
@@ -280,6 +286,22 @@ export default function CalendarPage() {
     staleTime: 0,
   });
 
+  // Fetch bill numbers for ALL teams (for the "All Teams" filter)
+  const allTeamBillQueries = useQueries({
+    queries: allTeams.map((t) => ({
+      queryKey: ["teamBills", t.id],
+      queryFn: () => api.entities.Team.getBillNumbers(t.id),
+      staleTime: 0,
+    })),
+  });
+  const allTeamsBillNumbers = useMemo(() => {
+    const combined = [];
+    allTeamBillQueries.forEach((q) => {
+      if (q.data) combined.push(...q.data);
+    });
+    return combined;
+  }, [allTeamBillQueries]);
+
   // Normalise bill identifiers for matching ("HB 123" → "HB123")
   const normalizeBillId = useCallback(
     (id) =>
@@ -297,11 +319,15 @@ export default function CalendarPage() {
     if (billFilter === "team") {
       return new Set(selectedTeamBillNumbers.map(normalizeBillId));
     }
+    if (billFilter === "allTeams") {
+      return new Set(allTeamsBillNumbers.map(normalizeBillId));
+    }
     return null; // "all" — no filtering
   }, [
     billFilter,
     personalTrackedBills,
     selectedTeamBillNumbers,
+    allTeamsBillNumbers,
     normalizeBillId,
   ]);
 
@@ -624,25 +650,28 @@ export default function CalendarPage() {
                     {/* Team Bills – split button: left half activates filter, right half opens team picker */}
                     <div className="flex">
                       <button
-                        onClick={() => setBillFilter("team")}
+                        onClick={() => setBillFilter("allTeams")}
                         className={`px-2.5 py-1 text-xs font-medium transition-colors border-r ${
-                          billFilter === "team"
+                          billFilter === "team" || billFilter === "allTeams"
                             ? "bg-indigo-600 text-white border-indigo-400"
                             : "bg-white text-slate-600 hover:bg-slate-100 border-slate-200"
                         }`}
                       >
                         <Users className="w-3 h-3 inline mr-0.5 -mt-0.5" />
-                        {billFilter === "team" && selectedTeamId
-                          ? (allTeams.find((t) => t.id === selectedTeamId)
-                              ?.name ?? "Team Bills")
-                          : "Team Bills"}
+                        {billFilter === "allTeams"
+                          ? "All Teams"
+                          : billFilter === "team" && selectedTeamId
+                            ? (allTeams.find((t) => t.id === selectedTeamId)
+                                ?.name ?? "Team Bills")
+                            : "Team Bills"}
                       </button>
                       {allTeams.length > 0 && (
                         <DropdownMenu>
                           <DropdownMenuTrigger asChild>
                             <button
                               className={`px-1.5 py-1 text-xs font-medium transition-colors ${
-                                billFilter === "team"
+                                billFilter === "team" ||
+                                billFilter === "allTeams"
                                   ? "bg-indigo-600 text-white hover:bg-indigo-700"
                                   : "bg-white text-slate-600 hover:bg-slate-100"
                               }`}
@@ -651,11 +680,28 @@ export default function CalendarPage() {
                             </button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end" className="text-xs">
+                            {allTeams.length > 1 && (
+                              <DropdownMenuItem
+                                className={`text-xs cursor-pointer ${
+                                  billFilter === "allTeams"
+                                    ? "font-semibold"
+                                    : ""
+                                }`}
+                                onClick={() => {
+                                  setBillFilter("allTeams");
+                                }}
+                              >
+                                All Teams
+                              </DropdownMenuItem>
+                            )}
                             {allTeams.map((t) => (
                               <DropdownMenuItem
                                 key={t.id}
                                 className={`text-xs cursor-pointer ${
-                                  selectedTeamId === t.id ? "font-semibold" : ""
+                                  billFilter === "team" &&
+                                  selectedTeamId === t.id
+                                    ? "font-semibold"
+                                    : ""
                                 }`}
                                 onClick={() => {
                                   setSelectedTeamId(t.id);
@@ -1567,6 +1613,36 @@ function LegislativeEventModal({ event, onClose }) {
         </DialogHeader>
 
         <div className="space-y-4 py-2">
+          {/* Video Link */}
+          {(event.videoUrl || event.scheduleUrl) && (
+            <div className="flex items-center gap-2 flex-wrap">
+              {event.videoUrl && (
+                <a
+                  href={event.videoUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 transition-colors"
+                >
+                  <Video className="w-3.5 h-3.5" />
+                  {event.videoUrl.includes("/search?")
+                    ? "Find Video on YouTube"
+                    : event.videoUrl.includes("youtube")
+                      ? "Watch on YouTube"
+                      : "Watch Video"}
+                </a>
+              )}
+              <a
+                href={event.scheduleUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-slate-50 text-slate-700 border border-slate-200 hover:bg-slate-100 transition-colors"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                GA Legislature Schedule
+              </a>
+            </div>
+          )}
+
           {/* Date & Time */}
           <div className="flex items-start gap-3 text-sm">
             <Clock className="w-4 h-4 text-slate-400 mt-0.5 shrink-0" />
@@ -1654,9 +1730,12 @@ function LegislativeEventModal({ event, onClose }) {
                         </p>
                       )}
                     </div>
-                    {bill.id && (
+                    {(bill.openstates_url || bill.id) && (
                       <a
-                        href={`https://v3.openstates.org/bills/${encodeURIComponent(bill.id)}`}
+                        href={
+                          bill.openstates_url ||
+                          `https://openstates.org/ga/bills/${encodeURIComponent((bill.session || "").replace(/\s+/g, "_"))}/${encodeURIComponent((bill.identifier || "").replace(/\s+/g, ""))}/`
+                        }
                         target="_blank"
                         rel="noopener noreferrer"
                         className="text-blue-600 hover:text-blue-800 shrink-0"
