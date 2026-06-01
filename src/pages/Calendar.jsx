@@ -205,34 +205,86 @@ export default function CalendarPage() {
     };
   }, [currentDate, view, monthRange]);
 
-  // Legislative events: fixed ±12-month window (doesn't expand with scroll)
-  const legQueryRange = useMemo(() => {
-    const ms = startOfMonth(addMonths(new Date(), -12));
-    const me = endOfMonth(addMonths(new Date(), 12));
-    return { start: ms.toISOString(), end: me.toISOString() };
-  }, []);
+  // Session start: Jan 1 of the current year (GA legislative session)
+  const SESSION_START = useMemo(
+    () => new Date(new Date().getFullYear(), 0, 1).toISOString(),
+    [],
+  );
+
+  // DB display range: session start → +12 months (full year of history + upcoming)
+  const legQueryRange = useMemo(
+    () => ({
+      start: SESSION_START,
+      end: endOfMonth(addMonths(new Date(), 12)).toISOString(),
+    }),
+    [SESSION_START],
+  );
+
+  // API sync range: session start → +3 months
+  // 25-page cap on initial load captures the full session history
+  const legSyncRange = useMemo(
+    () => ({
+      start: SESSION_START,
+      end: endOfMonth(addMonths(new Date(), 3)).toISOString(),
+    }),
+    [SESSION_START],
+  );
 
   // ── Fetch user events ──────────────────────────────────────
   const { data: userEvents = [], isLoading: isLoadingUser } = useQuery({
     queryKey: ["calendarEvents", queryRange.start, queryRange.end],
     queryFn: () => api.calendarEvents.list(queryRange.start, queryRange.end),
-    placeholderData: (prev) => prev, // keep previous data while refetching
+    placeholderData: (prev) => prev,
   });
 
-  // ── Fetch GA legislative events from Open States ────────────
-  const { data: legEvents = [], isLoading: isLoadingLeg } = useQuery({
-    queryKey: ["legEvents", legQueryRange.start, legQueryRange.end],
-    queryFn: () => fetchGAEvents(legQueryRange.start, legQueryRange.end),
-    staleTime: 30 * 60 * 1000, // 30 min — legislative events rarely change
-    gcTime: 60 * 60 * 1000, // keep in cache 1 hour
+  // ── Load legislative events from DB (persistent, instant) ──
+  // This is the primary display source — shows all history since session start.
+  const { data: dbLegEvents = [], isLoading: isLoadingLegDB } = useQuery({
+    queryKey: ["legEventsDB", legQueryRange.start, legQueryRange.end],
+    queryFn: () =>
+      api.legislativeEvents.list(legQueryRange.start, legQueryRange.end),
+    staleTime: 5 * 60 * 1000,
+    placeholderData: (prev) => prev,
+  });
+
+  // ── Background API sync → DB ────────────────────────────────
+  // Fetches from Open States and upserts to DB so:
+  //   - Past events accumulate and are never lost
+  //   - Rescheduled meetings overwrite their old time via upsert-by-id
+  // 25 pages on first run captures the full session history (~500 events max).
+  const { data: apiLegEvents = [], isLoading: isLoadingLegAPI } = useQuery({
+    queryKey: ["legEventsSync", legSyncRange.start, legSyncRange.end],
+    queryFn: async () => {
+      const events = await fetchGAEvents(
+        legSyncRange.start,
+        legSyncRange.end,
+        25,
+      );
+      if (events.length > 0) {
+        await api.legislativeEvents.upsert(events);
+      }
+      return events;
+    },
+    staleTime: 30 * 60 * 1000,
+    gcTime: 60 * 60 * 1000,
     retry: 2,
     retryDelay: (attempt) => Math.min(3000 * 2 ** attempt, 15000),
-    placeholderData: (prev) => prev, // keep previous data while refetching
+    placeholderData: (prev) => prev,
   });
 
-  const isLoading = isLoadingUser || isLoadingLeg;
+  // Loading: block UI only on user events + initial DB load (API sync is background)
+  const isLoading = isLoadingUser || isLoadingLegDB;
 
-  // ── Merge events ────────────────────────────────────────────
+  // ── Merge legislative event sources ────────────────────────
+  // DB is the base (history); fresh API results override by ID (catches reschedules)
+  const legEvents = useMemo(() => {
+    const map = new Map();
+    dbLegEvents.forEach((ev) => map.set(ev.id, ev));
+    apiLegEvents.forEach((ev) => map.set(ev.id, ev));
+    return Array.from(map.values());
+  }, [dbLegEvents, apiLegEvents]);
+
+  // ── Merge all events for display ───────────────────────────
   const events = useMemo(() => {
     const merged = [...userEvents];
     if (showLegislative) {
@@ -247,7 +299,6 @@ export default function CalendarPage() {
             });
       merged.push(...filtered);
     }
-    // Sort by start_time
     return merged.sort(
       (a, b) =>
         new Date(a.start_time).getTime() - new Date(b.start_time).getTime(),

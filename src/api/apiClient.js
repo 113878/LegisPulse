@@ -617,25 +617,14 @@ export const api = {
       },
 
       async createTeam(name) {
-        const userId = await getUserId();
-        const { data: sessionData } = await supabase.auth.getSession();
-        const email = sessionData?.session?.user?.email ?? "";
         if (!name || !name.trim()) throw new Error("Team name is required.");
-        const teamName = name.trim();
-        const { data: newTeam, error } = await supabase
-          .from("teams")
-          .insert({ name: teamName, created_by: userId })
-          .select()
-          .single();
-        if (error) throw error;
-        await supabase.from("team_members").insert({
-          team_id: newTeam.id,
-          user_id: userId,
-          email,
-          role: "owner",
-          status: "active",
+        const { data, error } = await supabase.rpc("create_team", {
+          p_name: name.trim(),
         });
-        return newTeam;
+        if (error) throw error;
+        const row = Array.isArray(data) ? data[0] : data;
+        if (!row) throw new Error("Failed to create team.");
+        return row;
       },
 
       async joinByCode(code) {
@@ -1273,6 +1262,63 @@ export const api = {
         .eq("user_id", userId)
         .eq("change_seen", false)
         .in("bill_number", billNumbers);
+      if (error) throw error;
+    },
+  },
+
+  // ─── Legislative Events ────────────────────────────────────────────────────
+  legislativeEvents: {
+    /** Ensures a date-only string ("2026-01-13") becomes a full ISO timestamp. */
+    _toTimestamp(dt) {
+      if (!dt) return null;
+      return dt.length <= 10 ? dt + "T00:00:00Z" : dt;
+    },
+
+    /** Convert a DB row back into the calendar event shape the UI expects. */
+    _fromRow(row) {
+      return { ...row, _source: "openstates" };
+    },
+
+    /** Fetch persisted legislative events within a date range. */
+    async list(startDate, endDate) {
+      const { data, error } = await supabase
+        .from("legislative_events")
+        .select("*")
+        .gte("start_time", startDate)
+        .lte("start_time", endDate)
+        .order("start_time", { ascending: true });
+      if (error) throw error;
+      return (data ?? []).map(this._fromRow);
+    },
+
+    /**
+     * Upsert normalized Open States events into the DB.
+     * Uses the Open States event ID as the conflict key so rescheduled
+     * meetings overwrite their old start_time rather than duplicating.
+     */
+    async upsert(normalizedEvents) {
+      if (!normalizedEvents?.length) return;
+      const now = new Date().toISOString();
+      const rows = normalizedEvents.map((ev) => ({
+        id: ev.id,
+        title: ev.title,
+        description: ev.description || null,
+        start_time: this._toTimestamp(ev.start_time),
+        end_time: this._toTimestamp(ev.end_time),
+        all_day: ev.all_day,
+        color: ev.color,
+        location: ev.location || null,
+        location_url: ev.location_url || null,
+        classification: ev.classification || null,
+        bills: ev.bills ?? [],
+        participants: ev.participants ?? [],
+        links: ev.links ?? [],
+        fetched_at: now,
+        updated_at: now,
+      }));
+      const { error } = await supabase
+        .from("legislative_events")
+        .upsert(rows, { onConflict: "id" });
       if (error) throw error;
     },
   },
