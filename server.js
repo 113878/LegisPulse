@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { join, extname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -84,6 +85,35 @@ function serveFile(filePath, res) {
 const server = createServer((req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   let pathname = decodeURIComponent(url.pathname);
+
+  // Proxy /api/openstates-graphql → https://openstates.org/graphql
+  if (pathname === "/api/openstates-graphql") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      const proxyReq = httpsRequest(
+        "https://openstates.org/graphql",
+        {
+          method: req.method,
+          headers: {
+            ...req.headers,
+            host: "openstates.org",
+          },
+        },
+        (proxyRes) => {
+          res.writeHead(proxyRes.statusCode, proxyRes.headers);
+          proxyRes.pipe(res);
+        },
+      );
+      proxyReq.on("error", (err) => {
+        console.error("Proxy error:", err.message);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Bad Gateway" }));
+      });
+      proxyReq.end(body);
+    });
+    return;
+  }
 
   // Try exact path first
   const filePath = join(DIST, pathname);

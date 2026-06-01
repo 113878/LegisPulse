@@ -808,6 +808,20 @@ export const api = {
         return map;
       },
 
+      /**
+       * Fetch bill data for the given bill_numbers across all team members.
+       * Uses a SECURITY DEFINER RPC so the caller can read bill rows
+       * belonging to other users, but only for bills tracked in their teams.
+       */
+      async getSharedTeamBillData(billNumbers) {
+        if (!billNumbers || billNumbers.length === 0) return [];
+        const { data, error } = await supabase.rpc("get_team_bills_data", {
+          p_bill_numbers: billNumbers,
+        });
+        if (error) throw error;
+        return data ?? [];
+      },
+
       /** Update metadata on a single team bill row. `fields` can contain flag, policy_assistant, bill_summary_notes. */
       async updateBillMetadata(teamId, billNumber, fields) {
         const { error } = await supabase
@@ -1136,130 +1150,197 @@ export const api = {
   },
 
   // ─── LC Number Tracking ────────────────────────────────────────────────────
+  //
+  // Architecture:
+  //   • `bill_lc_history` (global, one row per bill) is the source of
+  //     truth for the current and previous LC number. ANY user's
+  //     sync updates it, so a change detected by user A is
+  //     immediately visible to users B, C, … who track the same
+  //     bill (especially via shared team bills).
+  //   • `bill_lc_tracking` (per-user) records each user's
+  //     acknowledgment timestamp (`change_seen`, `change_seen_at`)
+  //     so the badge is per-user but the underlying change-detection
+  //     is shared.
   LcTracking: {
-    /** Fetch all LC tracking records for the current user. Returns map keyed by bill_number. */
+    /**
+     * Fetch the merged LC tracking map for the current user.
+     * Returns an object keyed by bill_number where each entry has
+     *   { current_lc, previous_lc, lc_changed_at,
+     *     change_seen, change_seen_at, last_checked }
+     * Values for current/previous/lc_changed_at come from the
+     * GLOBAL history table; change_seen/change_seen_at come from
+     * the per-user ack table. `change_seen` is computed: true iff
+     * the user has acked at or after the latest global change.
+     */
     async getAll() {
       const userId = await getUserId();
-      const { data, error } = await supabase
+
+      const { data: histRows, error: histErr } = await supabase
+        .from("bill_lc_history")
+        .select("bill_number, current_lc, previous_lc, lc_changed_at");
+      if (histErr) throw histErr;
+
+      const { data: ackRows, error: ackErr } = await supabase
         .from("bill_lc_tracking")
         .select(
           "bill_number, current_lc, previous_lc, lc_changed_at, change_seen, change_seen_at, last_checked",
         )
         .eq("user_id", userId);
-      if (error) throw error;
+      if (ackErr) throw ackErr;
+
+      const ackMap = {};
+      for (const r of ackRows ?? []) ackMap[r.bill_number] = r;
+
       const map = {};
-      for (const row of data ?? []) {
-        map[row.bill_number] = {
-          current_lc: row.current_lc,
-          previous_lc: row.previous_lc,
-          lc_changed_at: row.lc_changed_at,
-          change_seen: row.change_seen,
-          change_seen_at: row.change_seen_at,
-          last_checked: row.last_checked,
+      for (const h of histRows ?? []) {
+        const ack = ackMap[h.bill_number];
+        const ackAt = ack?.change_seen_at
+          ? new Date(ack.change_seen_at).getTime()
+          : 0;
+        const changedAt = h.lc_changed_at
+          ? new Date(h.lc_changed_at).getTime()
+          : 0;
+        const change_seen =
+          !h.previous_lc || h.previous_lc === h.current_lc
+            ? true
+            : ackAt >= changedAt && ackAt > 0;
+        map[h.bill_number] = {
+          current_lc: h.current_lc,
+          previous_lc: h.previous_lc,
+          lc_changed_at: h.lc_changed_at,
+          change_seen,
+          change_seen_at: ack?.change_seen_at ?? null,
+          last_checked: ack?.last_checked ?? null,
+        };
+      }
+      // Surface any legacy per-user-only rows (pre-history backfill)
+      // so already-tracked bills don't disappear from the UI.
+      for (const [bn, r] of Object.entries(ackMap)) {
+        if (map[bn]) continue;
+        map[bn] = {
+          current_lc: r.current_lc,
+          previous_lc: r.previous_lc,
+          lc_changed_at: r.lc_changed_at,
+          change_seen: r.change_seen,
+          change_seen_at: r.change_seen_at,
+          last_checked: r.last_checked,
         };
       }
       return map;
     },
 
-    /** Upsert LC tracking for a single bill. Detects changes and records them. */
-    async upsert(billNumber, newLc) {
-      const userId = await getUserId();
+    /**
+     * Update the GLOBAL bill_lc_history for the given entries.
+     * Detects changes against whatever is currently in the global
+     * table (NOT the user's per-user row), so the first user to
+     * sync wins and everyone else gets the notification.
+     */
+    async _updateGlobalHistory(entries) {
+      if (!entries?.length) return [];
       const now = new Date().toISOString();
+      const billNumbers = entries
+        .filter((e) => e.lc_number)
+        .map((e) => e.bill_number);
+      if (!billNumbers.length) return [];
 
-      // Fetch existing record
-      const { data: existing } = await supabase
-        .from("bill_lc_tracking")
-        .select("current_lc, previous_lc, lc_changed_at, change_seen")
-        .eq("user_id", userId)
-        .eq("bill_number", billNumber)
-        .maybeSingle();
+      const { data: existingRows, error: readErr } = await supabase
+        .from("bill_lc_history")
+        .select("bill_number, current_lc, previous_lc, lc_changed_at")
+        .in("bill_number", billNumbers);
+      if (readErr) throw readErr;
 
-      const oldLc = existing?.current_lc ?? null;
-      const isChange = oldLc !== null && newLc !== null && oldLc !== newLc;
+      const existingMap = {};
+      for (const r of existingRows ?? []) existingMap[r.bill_number] = r;
 
-      const { error } = await supabase.from("bill_lc_tracking").upsert(
-        {
-          user_id: userId,
-          bill_number: billNumber,
-          current_lc: newLc,
-          previous_lc: isChange ? oldLc : (existing?.previous_lc ?? null),
-          lc_changed_at: isChange ? now : (existing?.lc_changed_at ?? null),
-          change_seen: isChange ? false : (existing?.change_seen ?? true),
-          last_checked: now,
+      const upserts = [];
+      const changes = [];
+      for (const { bill_number, lc_number } of entries) {
+        if (!lc_number) continue;
+        const ex = existingMap[bill_number];
+        const oldLc = ex?.current_lc ?? null;
+        const isChange = oldLc !== null && oldLc !== lc_number;
+        upserts.push({
+          bill_number,
+          current_lc: lc_number,
+          previous_lc: isChange ? oldLc : (ex?.previous_lc ?? null),
+          lc_changed_at: isChange ? now : (ex?.lc_changed_at ?? null),
           updated_at: now,
-        },
-        { onConflict: "user_id,bill_number" },
-      );
-      if (error) throw error;
+        });
+        if (isChange) {
+          changes.push({
+            bill_number,
+            previous_lc: oldLc,
+            current_lc: lc_number,
+          });
+        }
+      }
+      if (!upserts.length) return changes;
+
+      const { error: upErr } = await supabase
+        .from("bill_lc_history")
+        .upsert(upserts, { onConflict: "bill_number" });
+      if (upErr) throw upErr;
+      return changes;
     },
 
-    /** Batch upsert LC tracking data. More efficient than calling upsert one by one. */
+    /** Upsert LC tracking for a single bill. */
+    async upsert(billNumber, newLc) {
+      if (!newLc) return;
+      await this.batchUpsert([{ bill_number: billNumber, lc_number: newLc }]);
+    },
+
+    /**
+     * Batch upsert LC numbers. Writes to the global history (where
+     * change detection actually happens, cross-user) and bumps the
+     * per-user row's `last_checked`. Ack state (`change_seen`,
+     * `change_seen_at`) is left untouched — it belongs to the user,
+     * not the syncing event.
+     */
     async batchUpsert(entries) {
       const userId = await getUserId();
       const now = new Date().toISOString();
 
-      // Get all existing records first
-      const { data: existingRows } = await supabase
-        .from("bill_lc_tracking")
-        .select(
-          "bill_number, current_lc, previous_lc, lc_changed_at, change_seen",
-        )
-        .eq("user_id", userId);
+      await this._updateGlobalHistory(entries);
 
-      const existingMap = {};
-      for (const row of existingRows ?? []) {
-        existingMap[row.bill_number] = row;
-      }
-
-      const upsertPayloads = [];
-      for (const { bill_number, lc_number } of entries) {
-        if (!lc_number) continue; // skip bills where we couldn't extract LC
-        const existing = existingMap[bill_number];
-        const oldLc = existing?.current_lc ?? null;
-        const isChange = oldLc !== null && oldLc !== lc_number;
-
-        upsertPayloads.push({
+      const trackingPayloads = entries
+        .filter((e) => e.lc_number)
+        .map(({ bill_number }) => ({
           user_id: userId,
           bill_number,
-          current_lc: lc_number,
-          previous_lc: isChange ? oldLc : (existing?.previous_lc ?? null),
-          lc_changed_at: isChange ? now : (existing?.lc_changed_at ?? null),
-          change_seen: isChange ? false : (existing?.change_seen ?? true),
           last_checked: now,
           updated_at: now,
-        });
-      }
-
-      if (upsertPayloads.length === 0) return;
+        }));
+      if (!trackingPayloads.length) return;
 
       const { error } = await supabase
         .from("bill_lc_tracking")
-        .upsert(upsertPayloads, { onConflict: "user_id,bill_number" });
+        .upsert(trackingPayloads, { onConflict: "user_id,bill_number" });
       if (error) throw error;
     },
 
-    /** Get count of unseen LC changes. */
+    /** Count of unseen LC changes for the current user. */
     async getUnseenCount() {
-      const userId = await getUserId();
-      const { count, error } = await supabase
-        .from("bill_lc_tracking")
-        .select("id", { count: "exact", head: true })
-        .eq("user_id", userId)
-        .eq("change_seen", false);
-      if (error) throw error;
-      return count ?? 0;
+      const map = await this.getAll();
+      let n = 0;
+      for (const t of Object.values(map)) {
+        if (t.previous_lc && t.previous_lc !== t.current_lc && !t.change_seen) {
+          n += 1;
+        }
+      }
+      return n;
     },
 
     /** Mark all unseen changes as seen with timestamp. */
     async markAllSeen() {
-      const userId = await getUserId();
-      const now = new Date().toISOString();
-      const { error } = await supabase
-        .from("bill_lc_tracking")
-        .update({ change_seen: true, change_seen_at: now, updated_at: now })
-        .eq("user_id", userId)
-        .eq("change_seen", false);
-      if (error) throw error;
+      const map = await this.getAll();
+      const unseen = Object.entries(map)
+        .filter(
+          ([, t]) =>
+            t.previous_lc && t.previous_lc !== t.current_lc && !t.change_seen,
+        )
+        .map(([bn]) => bn);
+      if (!unseen.length) return;
+      await this.markBillsSeen(unseen);
     },
 
     /** Mark specific bills' LC changes as seen with timestamp. */
@@ -1267,12 +1348,16 @@ export const api = {
       if (!billNumbers?.length) return;
       const userId = await getUserId();
       const now = new Date().toISOString();
+      const payloads = billNumbers.map((bn) => ({
+        user_id: userId,
+        bill_number: bn,
+        change_seen: true,
+        change_seen_at: now,
+        updated_at: now,
+      }));
       const { error } = await supabase
         .from("bill_lc_tracking")
-        .update({ change_seen: true, change_seen_at: now, updated_at: now })
-        .eq("user_id", userId)
-        .eq("change_seen", false)
-        .in("bill_number", billNumbers);
+        .upsert(payloads, { onConflict: "user_id,bill_number" });
       if (error) throw error;
     },
   },

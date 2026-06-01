@@ -201,7 +201,10 @@ export default function BillCard({
                 {bill.lc_number || lcTracking?.current_lc}
               </p>
               {lcTracking?.previous_lc &&
-                lcTracking.previous_lc !== lcTracking.current_lc && (
+                lcTracking.previous_lc !== lcTracking.current_lc &&
+                lcTracking.lc_changed_at &&
+                Date.now() - new Date(lcTracking.lc_changed_at).getTime() <
+                  24 * 60 * 60 * 1000 && (
                   <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-amber-50 border border-amber-200 text-xs">
                     <RefreshCw className="w-3 h-3 text-amber-600 shrink-0" />
                     <span className="text-amber-800 font-medium">
