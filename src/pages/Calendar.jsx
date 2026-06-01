@@ -13,7 +13,17 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { api } from "@/api/apiClient";
-import { fetchGAEvents } from "@/services/openstates";
+import {
+  fetchGAMeetings,
+  fetchAllCommittees,
+  matchMeetingToCommittee,
+  fetchCommitteeBills,
+} from "@/services/legisGa";
+import {
+  fetchCachedMeetings,
+  syncMeetingsRange,
+  getSessionStartDate,
+} from "@/services/gaMeetingsCache";
 import { useToast } from "@/components/ui/use-toast";
 import {
   format,
@@ -228,9 +238,12 @@ export default function CalendarPage() {
     };
   }, [currentDate, view, monthRange]);
 
-  // Legislative events: fixed ±12-month window (doesn't expand with scroll)
+  // Legislative events: from the start of the current GA session through
+  // ~12 months out. We *read* from the Supabase cache (so past meetings
+  // never disappear), and a background sync keeps the cache fresh.
   const legQueryRange = useMemo(() => {
-    const ms = startOfMonth(addMonths(new Date(), -12));
+    const sessionStart = getSessionStartDate();
+    const ms = startOfMonth(sessionStart);
     const me = endOfMonth(addMonths(new Date(), 12));
     return { start: ms.toISOString(), end: me.toISOString() };
   }, []);
@@ -242,18 +255,135 @@ export default function CalendarPage() {
     placeholderData: (prev) => prev, // keep previous data while refetching
   });
 
-  // ── Fetch GA legislative events from Open States ────────────
+  // ── Fetch GA legislative events from Supabase cache ───────────
+  // The cache is populated by the background sync below from the
+  // legis.ga.gov private API. Reading from cache means past meetings
+  // remain visible after the upstream API drops them.
   const { data: legEvents = [], isLoading: isLoadingLeg } = useQuery({
-    queryKey: ["legEvents", legQueryRange.start, legQueryRange.end],
-    queryFn: () => fetchGAEvents(legQueryRange.start, legQueryRange.end),
-    staleTime: 30 * 60 * 1000, // 30 min — legislative events rarely change
-    gcTime: 60 * 60 * 1000, // keep in cache 1 hour
-    retry: 2,
-    retryDelay: (attempt) => Math.min(3000 * 2 ** attempt, 15000),
-    placeholderData: (prev) => prev, // keep previous data while refetching
+    queryKey: ["legEventsCached", legQueryRange.start, legQueryRange.end],
+    queryFn: () => fetchCachedMeetings(legQueryRange.start, legQueryRange.end),
+    staleTime: 5 * 60 * 1000,
+    gcTime: 60 * 60 * 1000,
+    placeholderData: (prev) => prev,
   });
 
+  // ── Background sync: refresh the cache from the API ───────────
+  // On mount, sync the full session window (Jan 1 of current year →
+  // today + 90 days). When the visible month-range scrolls into a new
+  // window, sync just that window again so reschedules show up
+  // promptly. Each sync invalidates the cached-read query so the UI
+  // picks up the new rows.
+  const lastSyncedRangeRef = useRef(null);
+  useEffect(() => {
+    let cancelled = false;
+    const sessionStart = getSessionStartDate();
+    const futureEnd = addMonths(new Date(), 3);
+    const key = `${sessionStart.toISOString()}_${futureEnd.toISOString()}`;
+    if (lastSyncedRangeRef.current === key) return;
+    lastSyncedRangeRef.current = key;
+    (async () => {
+      try {
+        await syncMeetingsRange(sessionStart, futureEnd);
+        if (!cancelled) {
+          queryClient.invalidateQueries({ queryKey: ["legEventsCached"] });
+        }
+      } catch (err) {
+        console.warn("Initial meetings sync failed:", err?.message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [queryClient]);
+
+  // When the user scrolls into a new visible window, refresh just that
+  // window so any reschedules appear quickly.
+  useEffect(() => {
+    let cancelled = false;
+    const start = new Date(queryRange.start);
+    const end = new Date(queryRange.end);
+    (async () => {
+      try {
+        await syncMeetingsRange(start, end);
+        if (!cancelled) {
+          queryClient.invalidateQueries({ queryKey: ["legEventsCached"] });
+        }
+      } catch (err) {
+        console.warn("Visible-range meetings sync failed:", err?.message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [queryRange.start, queryRange.end, queryClient]);
+
   const isLoading = isLoadingUser || isLoadingLeg;
+  // Only show the full-screen spinner on the very first load (no data yet).
+  // Subsequent background refetches keep the calendar mounted so the view
+  // doesn't snap back to the current month.
+  const isInitialLoad =
+    isLoading && userEvents.length === 0 && legEvents.length === 0;
+
+  // ── Committee lookup for legislative events (for bill associations) ──
+  const { data: allCommittees = [] } = useQuery({
+    queryKey: ["gaAllCommittees"],
+    queryFn: () => fetchAllCommittees(),
+    staleTime: 60 * 60 * 1000, // 1h
+    gcTime: 24 * 60 * 60 * 1000,
+  });
+
+  // Attach committeeId to each legislative event by parsing its subject
+  const legEventsWithCommittees = useMemo(() => {
+    if (!legEvents.length) return legEvents;
+    if (!allCommittees.length)
+      return legEvents.map((ev) => ({ ...ev, committeeId: null }));
+    return legEvents.map((ev) => {
+      const c = matchMeetingToCommittee(ev, allCommittees);
+      return c
+        ? { ...ev, committeeId: c.id, committeeName: c.name }
+        : { ...ev, committeeId: null };
+    });
+  }, [legEvents, allCommittees]);
+
+  // Fetch bills for each unique committee that appears in current legEvents.
+  // Each query is cached independently so revisiting events is free.
+  const uniqueCommitteeIds = useMemo(() => {
+    const set = new Set();
+    legEventsWithCommittees.forEach((ev) => {
+      if (ev.committeeId) set.add(ev.committeeId);
+    });
+    return Array.from(set);
+  }, [legEventsWithCommittees]);
+
+  const committeeBillQueries = useQueries({
+    queries: uniqueCommitteeIds.map((cid) => ({
+      queryKey: ["committeeBills", cid],
+      queryFn: () => fetchCommitteeBills(cid),
+      staleTime: 30 * 60 * 1000,
+      gcTime: 60 * 60 * 1000,
+    })),
+  });
+
+  // Map: committeeId → bills[]
+  const committeeBillsById = useMemo(() => {
+    const map = new Map();
+    uniqueCommitteeIds.forEach((cid, i) => {
+      const q = committeeBillQueries[i];
+      if (q?.data) map.set(cid, q.data);
+    });
+    return map;
+  }, [uniqueCommitteeIds, committeeBillQueries]);
+
+  // Build the final leg events array with .bills populated
+  const legEventsWithBills = useMemo(() => {
+    if (committeeBillsById.size === 0) return legEventsWithCommittees;
+    return legEventsWithCommittees.map((ev) => {
+      if (!ev.committeeId) return ev;
+      const bills = committeeBillsById.get(ev.committeeId);
+      if (!bills) return ev;
+      return { ...ev, bills };
+    });
+  }, [legEventsWithCommittees, committeeBillsById]);
 
   // ── Bill-tracking queries for My Bills / Team Bills filters ──
   const { data: userData } = useQuery({
@@ -337,12 +467,16 @@ export default function CalendarPage() {
     if (showLegislative) {
       let filtered =
         chamberFilter === "all"
-          ? legEvents
-          : legEvents.filter((ev) => {
+          ? legEventsWithBills
+          : legEventsWithBills.filter((ev) => {
+              // Prefer the explicit chamber field from legis.ga.gov
+              // (1 = House, 2 = Senate). Fall back to the title prefix.
+              if (ev.chamber === 1) return chamberFilter === "house";
+              if (ev.chamber === 2) return chamberFilter === "senate";
               const t = (ev.title ?? "").toLowerCase();
               return chamberFilter === "senate"
-                ? t.startsWith("senate")
-                : t.startsWith("house");
+                ? t.includes("(senate)") || t.startsWith("senate")
+                : t.includes("(house)") || t.startsWith("house");
             });
       // Apply bill-tracking filter (My Bills / Team Bills)
       if (activeBillSet) {
@@ -363,7 +497,7 @@ export default function CalendarPage() {
     );
   }, [
     userEvents,
-    legEvents,
+    legEventsWithBills,
     showLegislative,
     chamberFilter,
     activeBillSet,
@@ -443,7 +577,7 @@ export default function CalendarPage() {
 
   const openEditEvent = useCallback((ev) => {
     // Legislative events are read-only — show detail modal instead
-    if (ev._source === "openstates") {
+    if (ev._source === "legis-ga" || ev._source === "openstates") {
       setLegEventDetail(ev);
       return;
     }
@@ -730,7 +864,7 @@ export default function CalendarPage() {
 
           {/* Day-of-week row – part of the sticky header block in month view */}
           {view === "month" && (
-            <div className="grid grid-cols-7 border-b border-slate-200/50 bg-white/60 backdrop-blur-xl backdrop-saturate-150">
+            <div className="grid grid-cols-7 border-b border-slate-200/60 bg-white/55 backdrop-blur-2xl backdrop-saturate-200">
               {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d) => (
                 <div
                   key={d}
@@ -751,28 +885,35 @@ export default function CalendarPage() {
         {/* ── View body ─────────────────────────────────────────── */}
         <div
           className={
-            view === "month" ? "min-h-0" : "flex-1 overflow-auto min-h-0"
+            view === "month"
+              ? "min-h-0 relative"
+              : "flex-1 overflow-auto min-h-0 relative"
           }
         >
-          {isLoading ? (
+          {isInitialLoad ? (
             <div className="flex items-center justify-center h-64">
               <div className="w-8 h-8 border-4 border-slate-200 border-t-blue-600 rounded-full animate-spin" />
             </div>
           ) : view === "month" ? (
-            <MonthView
-              currentDate={currentDate}
-              events={events}
-              onVisibleMonthChange={setScrollMonthLabel}
-              scrollContainerRef={pageScrollRef}
-              stickyHeaderRef={stickyHeaderRef}
-              onDayClick={(d) => {
-                setCurrentDate(d);
-                setView("day");
-              }}
-              onNewEvent={openNewEvent}
-              onEditEvent={openEditEvent}
-              onRangeExpand={handleRangeExpand}
-            />
+            <>
+              {isLoading && (
+                <div className="absolute top-3 right-3 z-30 w-5 h-5 border-2 border-slate-200 border-t-blue-600 rounded-full animate-spin pointer-events-none" />
+              )}
+              <MonthView
+                currentDate={currentDate}
+                events={events}
+                onVisibleMonthChange={setScrollMonthLabel}
+                scrollContainerRef={pageScrollRef}
+                stickyHeaderRef={stickyHeaderRef}
+                onDayClick={(d) => {
+                  setCurrentDate(d);
+                  setView("day");
+                }}
+                onNewEvent={openNewEvent}
+                onEditEvent={openEditEvent}
+                onRangeExpand={handleRangeExpand}
+              />
+            </>
           ) : view === "week" ? (
             <WeekView
               currentDate={currentDate}
@@ -1056,11 +1197,11 @@ function MonthView({
   onEditEvent,
   onRangeExpand,
 }) {
-  const INITIAL_BEFORE = 3;
-  const INITIAL_AFTER = 3;
-  const LOAD_MORE = 12; // add 12 months each time we hit an edge
-  const EDGE_PX = 800; // trigger when within 800px of edge
-  const MAX_MONTHS = 120; // cap at ±10 years to prevent memory bloat
+  const INITIAL_BEFORE = 6;
+  const INITIAL_AFTER = 6;
+  const LOAD_MORE = 18; // add 18 months each time we hit an edge
+  const EDGE_PX = 2400; // start expanding well before the user reaches the edge
+  const MAX_MONTHS = 240; // cap at ±20 years to prevent memory bloat
 
   const [beforeCount, setBeforeCount] = useState(INITIAL_BEFORE);
   const [afterCount, setAfterCount] = useState(INITIAL_AFTER);
@@ -1120,6 +1261,7 @@ function MonthView({
   // Also detect when user is near edges to load more months
   const visibleMonthRef = useRef(format(currentDate, "MMMM yyyy"));
   const pendingScrollFix = useRef(null); // stores previous scrollHeight when prepending
+  const rafPending = useRef(false); // throttle flag for visible-month update
 
   // Restore scroll position after prepending months (runs synchronously before paint)
   useLayoutEffect(() => {
@@ -1136,48 +1278,60 @@ function MonthView({
   const handleScroll = useCallback(() => {
     const container = scrollRef.current;
     if (!container) return;
-    const containerTop = container.getBoundingClientRect().top;
-    const containerMid = containerTop + container.clientHeight * 0.35;
 
-    let closestMonth = null;
-    let closestDist = Infinity;
-    for (const [key, el] of Object.entries(monthRefs.current)) {
-      if (!el) continue;
-      const rect = el.getBoundingClientRect();
-      const dist = Math.abs(rect.top + rect.height / 2 - containerMid);
-      if (dist < closestDist) {
-        closestDist = dist;
-        closestMonth = key;
-      }
-    }
-
-    if (closestMonth) {
-      const [year, month] = closestMonth.split("-").map(Number);
-      const label = format(new Date(year, month - 1, 1), "MMMM yyyy");
-      if (label !== visibleMonthRef.current) {
-        visibleMonthRef.current = label;
-        onVisibleMonthChange(label);
-      }
-    }
-
-    // --- Infinite scroll: expand when near edges ---
+    // --- Infinite scroll: expand when near edges (cheap, do every event) ---
     const { scrollTop, scrollHeight, clientHeight } = container;
-    // Near bottom? Load more future months (capped)
     if (scrollHeight - scrollTop - clientHeight < EDGE_PX) {
       setAfterCount((c) => Math.min(c + LOAD_MORE, MAX_MONTHS));
     }
-    // Near top? Load more past months (capped, only if not already pending)
     if (scrollTop < EDGE_PX && pendingScrollFix.current === null) {
       pendingScrollFix.current = scrollHeight;
       setBeforeCount((c) => Math.min(c + LOAD_MORE, MAX_MONTHS));
     }
+
+    // --- Visible-month label update (expensive: getBoundingClientRect on
+    // every month element). Throttle via requestAnimationFrame so it runs at
+    // most once per frame, regardless of how fast the user scrolls.
+    if (rafPending.current) return;
+    rafPending.current = true;
+    requestAnimationFrame(() => {
+      rafPending.current = false;
+      const c2 = scrollRef.current;
+      if (!c2) return;
+      const containerTop = c2.getBoundingClientRect().top;
+      const containerMid = containerTop + c2.clientHeight * 0.35;
+
+      let closestMonth = null;
+      let closestDist = Infinity;
+      for (const [key, el] of Object.entries(monthRefs.current)) {
+        if (!el) continue;
+        const rect = el.getBoundingClientRect();
+        // Quick reject: skip elements entirely above/below the viewport
+        if (rect.bottom < containerTop - 200) continue;
+        if (rect.top > containerTop + c2.clientHeight + 200) continue;
+        const dist = Math.abs(rect.top + rect.height / 2 - containerMid);
+        if (dist < closestDist) {
+          closestDist = dist;
+          closestMonth = key;
+        }
+      }
+
+      if (closestMonth) {
+        const [year, month] = closestMonth.split("-").map(Number);
+        const label = format(new Date(year, month - 1, 1), "MMMM yyyy");
+        if (label !== visibleMonthRef.current) {
+          visibleMonthRef.current = label;
+          onVisibleMonthChange(label);
+        }
+      }
+    });
   }, [onVisibleMonthChange]);
 
-  // Attach scroll listener to the shared scroll container
+  // Attach scroll listener to the shared scroll container (passive for perf)
   useEffect(() => {
     const container = scrollRef.current;
     if (!container) return;
-    container.addEventListener("scroll", handleScroll);
+    container.addEventListener("scroll", handleScroll, { passive: true });
     return () => container.removeEventListener("scroll", handleScroll);
   }, [handleScroll, scrollRef]);
 
@@ -1199,7 +1353,11 @@ function MonthView({
         const days = eachDayOfInterval({ start: calStart, end: calEnd });
 
         return (
-          <div key={mKey} ref={(el) => (monthRefs.current[mKey] = el)}>
+          <div
+            key={mKey}
+            ref={(el) => (monthRefs.current[mKey] = el)}
+            className="calendar-month-block"
+          >
             {/* Month label */}
             <div className="bg-white/95 backdrop-blur-sm border-b border-slate-100 px-3 py-1.5 shrink-0">
               <span className="text-sm font-bold text-slate-700">
@@ -1252,7 +1410,9 @@ function MonthView({
                     <div className="space-y-0.5 overflow-hidden">
                       {dayEvents.slice(0, 3).map((ev) => {
                         const cc = getColorClasses(ev.color);
-                        const isLeg = ev._source === "openstates";
+                        const isLeg =
+                          ev._source === "legis-ga" ||
+                          ev._source === "openstates";
                         return (
                           <button
                             key={ev.id}
@@ -1381,7 +1541,8 @@ function WeekView({ currentDate, events, onNewEvent, onEditEvent }) {
                           }}
                         >
                           <span className="font-semibold truncate block flex items-center gap-0.5">
-                            {ev._source === "openstates" && (
+                            {(ev._source === "legis-ga" ||
+                              ev._source === "openstates") && (
                               <Landmark className="w-3 h-3 shrink-0" />
                             )}
                             {ev.title}
@@ -1435,7 +1596,8 @@ function DayView({ currentDate, events, onNewEvent, onEditEvent }) {
           <div className="flex flex-wrap gap-1 mt-1">
             {allDayEvents.map((ev) => {
               const cc = getColorClasses(ev.color);
-              const isLeg = ev._source === "openstates";
+              const isLeg =
+                ev._source === "legis-ga" || ev._source === "openstates";
               return (
                 <button
                   key={ev.id}
@@ -1497,7 +1659,8 @@ function DayView({ currentDate, events, onNewEvent, onEditEvent }) {
                           }}
                         >
                           <div className="font-semibold truncate flex items-center gap-1">
-                            {ev._source === "openstates" && (
+                            {(ev._source === "legis-ga" ||
+                              ev._source === "openstates") && (
                               <Landmark className="w-3.5 h-3.5 shrink-0" />
                             )}
                             {ev.title}
@@ -1613,8 +1776,8 @@ function LegislativeEventModal({ event, onClose }) {
         </DialogHeader>
 
         <div className="space-y-4 py-2">
-          {/* Video Link */}
-          {(event.videoUrl || event.scheduleUrl) && (
+          {/* Video / Agenda / Schedule links */}
+          {(event.videoUrl || event.agendaUrl || event.scheduleUrl) && (
             <div className="flex items-center gap-2 flex-wrap">
               {event.videoUrl && (
                 <a
@@ -1626,9 +1789,24 @@ function LegislativeEventModal({ event, onClose }) {
                   <Video className="w-3.5 h-3.5" />
                   {event.videoUrl.includes("/search?")
                     ? "Find Video on YouTube"
-                    : event.videoUrl.includes("youtube")
-                      ? "Watch on YouTube"
-                      : "Watch Video"}
+                    : event.videoUrl.toLowerCase().includes("vimeo")
+                      ? "Watch on Vimeo"
+                      : event.videoUrl.includes("youtube")
+                        ? "Watch on YouTube"
+                        : event.videoUrl.includes("livestream.com")
+                          ? "Watch on Livestream"
+                          : "Watch Video"}
+                </a>
+              )}
+              {event.agendaUrl && (
+                <a
+                  href={event.agendaUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-indigo-50 text-indigo-700 border border-indigo-200 hover:bg-indigo-100 transition-colors"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  Agenda (PDF)
                 </a>
               )}
               <a
@@ -1708,13 +1886,16 @@ function LegislativeEventModal({ event, onClose }) {
           {event.bills?.length > 0 && (
             <div>
               <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1.5">
-                <FileText className="w-3.5 h-3.5" /> Associated Bills (
-                {event.bills.length})
+                <FileText className="w-3.5 h-3.5" />
+                {event.committeeName
+                  ? `Bills Assigned to ${event.committeeName}`
+                  : "Associated Bills"}{" "}
+                ({event.bills.length})
               </h4>
-              <div className="space-y-2 max-h-[200px] overflow-y-auto">
+              <div className="space-y-2 max-h-[260px] overflow-y-auto pr-1">
                 {event.bills.map((bill, i) => (
                   <div
-                    key={i}
+                    key={bill.id ?? i}
                     className="flex items-start gap-2 p-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 transition-colors"
                   >
                     <div className="w-6 h-6 rounded bg-blue-100 flex items-center justify-center shrink-0 mt-0.5">
@@ -1724,22 +1905,25 @@ function LegislativeEventModal({ event, onClose }) {
                       <p className="text-sm font-semibold text-slate-800">
                         {bill.identifier}
                       </p>
-                      {bill.note && (
+                      {(bill.title || bill.note) && (
                         <p className="text-xs text-slate-500 mt-0.5 line-clamp-2">
-                          {bill.note}
+                          {bill.title || bill.note}
+                        </p>
+                      )}
+                      {bill.status && (
+                        <p className="text-[10px] text-slate-400 mt-0.5">
+                          {bill.status}
+                          {bill.statusDate ? ` · ${bill.statusDate}` : ""}
                         </p>
                       )}
                     </div>
-                    {(bill.openstates_url || bill.id) && (
+                    {bill.openstates_url && (
                       <a
-                        href={
-                          bill.openstates_url ||
-                          `https://openstates.org/ga/bills/${encodeURIComponent((bill.session || "").replace(/\s+/g, "_"))}/${encodeURIComponent((bill.identifier || "").replace(/\s+/g, ""))}/`
-                        }
+                        href={bill.openstates_url}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="text-blue-600 hover:text-blue-800 shrink-0"
-                        title="View on Open States"
+                        title="View on legis.ga.gov"
                       >
                         <ExternalLink className="w-3.5 h-3.5" />
                       </a>

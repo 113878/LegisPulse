@@ -1,9 +1,11 @@
 import { useState, useMemo, useCallback, useEffect } from "react";
 import { useQuery, useQueries } from "@tanstack/react-query";
 import {
-  fetchGACommittees,
-  fetchBillsByCommittee,
-} from "@/services/openstates";
+  CHAMBER,
+  fetchCommittees,
+  fetchCommitteeDetails,
+  fetchCommitteeBills,
+} from "@/services/legisGa";
 import { api } from "@/api/apiClient";
 import {
   Building2,
@@ -16,6 +18,8 @@ import {
   Search,
   Loader2,
   Star,
+  Phone,
+  MapPin,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
@@ -40,20 +44,35 @@ export default function CommitteesPage() {
   const [trackingFilter, setTrackingFilter] = useState("all"); // all | my | team | allTeams
   const [selectedTeamId, setSelectedTeamId] = useState(null);
 
+  // Map UI chamber ("upper"/"lower") → legis.ga.gov ChamberType enum
+  const chamberCode =
+    selectedChamber === "upper"
+      ? CHAMBER.SENATE
+      : selectedChamber === "lower"
+        ? CHAMBER.HOUSE
+        : null;
+
   // ── Fetch committees for the selected chamber ──
   const { data: committees = [], isLoading: loadingCommittees } = useQuery({
-    queryKey: ["gaCommittees", selectedChamber],
-    queryFn: () => fetchGACommittees(selectedChamber),
-    enabled: !!selectedChamber,
+    queryKey: ["gaCommittees", chamberCode],
+    queryFn: () => fetchCommittees(chamberCode),
+    enabled: !!chamberCode,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  // ── Fetch committee details (members, address) ──
+  const { data: committeeDetails, isLoading: loadingDetails } = useQuery({
+    queryKey: ["committeeDetails", selectedCommittee?.id],
+    queryFn: () => fetchCommitteeDetails(selectedCommittee.id),
+    enabled: !!selectedCommittee?.id,
     staleTime: 5 * 60 * 1000,
   });
 
   // ── Fetch bills for the selected committee ──
   const { data: committeeBills = [], isLoading: loadingBills } = useQuery({
-    queryKey: ["committeeBills", selectedCommittee?.name, selectedChamber],
-    queryFn: () =>
-      fetchBillsByCommittee(selectedCommittee.name, selectedChamber),
-    enabled: !!selectedCommittee && !!selectedChamber,
+    queryKey: ["committeeBills", selectedCommittee?.id],
+    queryFn: () => fetchCommitteeBills(selectedCommittee.id),
+    enabled: !!selectedCommittee?.id,
     staleTime: 5 * 60 * 1000,
   });
 
@@ -353,8 +372,24 @@ export default function CommitteesPage() {
               </h1>
               <p className="text-sm text-slate-500">{chamberLabel} Committee</p>
             </div>
+            <a
+              href={`https://www.legis.ga.gov/committees/${chamberLabel.toLowerCase()}/${selectedCommittee.id}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="ml-auto text-xs text-slate-500 hover:text-slate-800 flex items-center gap-1 shrink-0"
+              title="View on legis.ga.gov"
+            >
+              legis.ga.gov <ExternalLink className="w-3 h-3" />
+            </a>
           </div>
         </div>
+
+        {/* Committee info card (address, phone, members) */}
+        <CommitteeInfoCard
+          details={committeeDetails}
+          loading={loadingDetails}
+          chamberColor={chamberColor}
+        />
 
         {/* Tabs: Current vs All */}
         <div className="flex items-center gap-4 mb-4 border-b border-slate-200">
@@ -648,6 +683,136 @@ function BillRow({ bill }) {
           </div>
         )}
       </div>
+    </Card>
+  );
+}
+
+// ─── Committee Info Card (address, phone, members) ───────────
+function CommitteeInfoCard({ details, loading, chamberColor }) {
+  const [showAllMembers, setShowAllMembers] = useState(false);
+
+  if (loading) {
+    return (
+      <Card className="p-4 mb-6 flex items-center justify-center">
+        <Loader2 className="w-4 h-4 text-slate-400 animate-spin" />
+        <span className="ml-2 text-xs text-slate-500">
+          Loading committee info…
+        </span>
+      </Card>
+    );
+  }
+  if (!details) return null;
+
+  const { address, members = [] } = details;
+  // Sort by roleSort so Chairman/Vice/Secretary come first
+  const sortedMembers = [...members].sort(
+    (a, b) => (a.roleSort ?? 99) - (b.roleSort ?? 99),
+  );
+  const previewCount = 6;
+  const displayed = showAllMembers
+    ? sortedMembers
+    : sortedMembers.slice(0, previewCount);
+  const hasMore = sortedMembers.length > previewCount;
+
+  const roleColor = (role) => {
+    const r = (role || "").toLowerCase();
+    if (r.includes("chair") && !r.includes("vice"))
+      return "bg-amber-100 text-amber-800 border-amber-200";
+    if (r.includes("vice"))
+      return "bg-orange-50 text-orange-700 border-orange-200";
+    if (r.includes("secretary"))
+      return "bg-purple-50 text-purple-700 border-purple-200";
+    if (r.includes("ex officio"))
+      return "bg-slate-100 text-slate-600 border-slate-200";
+    return chamberColor === "blue"
+      ? "bg-blue-50 text-blue-700 border-blue-200"
+      : "bg-emerald-50 text-emerald-700 border-emerald-200";
+  };
+
+  const cleanZip = (address?.zip ?? "").trim();
+  const cleanState = (address?.state ?? "").trim();
+  const cleanPhone = (address?.phone ?? "").replace(/\D/g, "");
+  const phoneDisplay =
+    cleanPhone.length === 10
+      ? `(${cleanPhone.slice(0, 3)}) ${cleanPhone.slice(3, 6)}-${cleanPhone.slice(6)}`
+      : (address?.phone ?? "");
+
+  return (
+    <Card className="p-4 mb-6">
+      {address && (address.address1 || address.phone) && (
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-1.5 text-xs text-slate-600 mb-4 pb-4 border-b border-slate-100">
+          {address.address1 && (
+            <span className="flex items-center gap-1.5">
+              <MapPin className="w-3.5 h-3.5 text-slate-400" />
+              {address.address1}
+              {address.address2 ? `, ${address.address2}` : ""}
+              {address.city ? `, ${address.city}` : ""}
+              {cleanState ? `, ${cleanState}` : ""}
+              {cleanZip ? ` ${cleanZip}` : ""}
+            </span>
+          )}
+          {cleanPhone && (
+            <a
+              href={`tel:+1${cleanPhone}`}
+              className="flex items-center gap-1.5 hover:text-slate-900"
+            >
+              <Phone className="w-3.5 h-3.5 text-slate-400" />
+              {phoneDisplay}
+            </a>
+          )}
+        </div>
+      )}
+
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
+          Members ({sortedMembers.length})
+        </h3>
+      </div>
+
+      {sortedMembers.length === 0 ? (
+        <p className="text-xs text-slate-400">No members listed.</p>
+      ) : (
+        <>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+            {displayed.map((m) => (
+              <div
+                key={m.id}
+                className="flex items-center justify-between gap-2 p-2 rounded-md bg-slate-50 border border-slate-100"
+              >
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-slate-800 truncate">
+                    {m.name}
+                  </div>
+                  {m.district && (
+                    <div className="text-[11px] text-slate-500">
+                      District {m.district}
+                    </div>
+                  )}
+                </div>
+                <Badge
+                  variant="outline"
+                  className={`text-[10px] shrink-0 ${roleColor(m.role)}`}
+                >
+                  {m.role}
+                </Badge>
+              </div>
+            ))}
+          </div>
+          {hasMore && (
+            <button
+              onClick={() => setShowAllMembers((v) => !v)}
+              className="mt-3 text-xs font-medium text-slate-500 hover:text-slate-800 flex items-center gap-1"
+            >
+              {showAllMembers
+                ? "Show fewer"
+                : `Show all ${sortedMembers.length} members`}
+              <ChevronDown
+                className={`w-3 h-3 transition-transform ${showAllMembers ? "rotate-180" : ""}`}
+              />
+            </button>
+          )}
+        </>
+      )}
     </Card>
   );
 }
