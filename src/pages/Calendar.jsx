@@ -1,11 +1,5 @@
-import {
-  useState,
-  useMemo,
-  useCallback,
-  useRef,
-  useEffect,
-  useLayoutEffect,
-} from "react";
+import { useState, useMemo, useCallback, useRef, useEffect } from "react";
+import { flushSync } from "react-dom";
 import {
   useQuery,
   useQueries,
@@ -1197,8 +1191,8 @@ function MonthView({
   onEditEvent,
   onRangeExpand,
 }) {
-  const INITIAL_BEFORE = 6;
-  const INITIAL_AFTER = 6;
+  const INITIAL_BEFORE = 12;
+  const INITIAL_AFTER = 12;
   const LOAD_MORE = 18; // add 18 months each time we hit an edge
   const EDGE_PX = 2400; // start expanding well before the user reaches the edge
   const MAX_MONTHS = 240; // cap at ±20 years to prevent memory bloat
@@ -1230,6 +1224,8 @@ function MonthView({
   const monthRefs = useRef({});
   const hasScrolledToCenter = useRef(false);
   const prevCurrentDate = useRef(currentDate);
+  // Guard so we ignore the programmatic scroll caused by Today/arrow nav.
+  const suppressEdgeUntilRef = useRef(0);
 
   // Scroll the *current* month into view on mount and when currentDate changes
   useEffect(() => {
@@ -1247,6 +1243,10 @@ function MonthView({
         const elRect = el.getBoundingClientRect();
         const scrollTop =
           container.scrollTop + (elRect.top - containerRect.top) - headerHeight;
+        // Suppress edge-loading for ~700ms while smooth-scroll animates,
+        // otherwise the animation can trip the top/bottom edge thresholds
+        // and snap the user back.
+        suppressEdgeUntilRef.current = performance.now() + 700;
         container.scrollTo({
           top: Math.max(0, scrollTop),
           behavior: dateChanged ? "smooth" : "instant",
@@ -1257,75 +1257,113 @@ function MonthView({
     }
   }, [currentDate]); // only scroll when the user actively navigates (Today/arrows)
 
-  // Update header label as user scrolls – lightweight, no cascading re-render
-  // Also detect when user is near edges to load more months
+  // ── Visible-month label via IntersectionObserver ───────────────
+  // Much cheaper than reading getBoundingClientRect for every month on
+  // every scroll event; the browser delivers entries already coalesced.
   const visibleMonthRef = useRef(format(currentDate, "MMMM yyyy"));
-  const pendingScrollFix = useRef(null); // stores previous scrollHeight when prepending
-  const rafPending = useRef(false); // throttle flag for visible-month update
+  const monthVisibilityRef = useRef(new Map()); // monthKey -> intersectionRatio
 
-  // Restore scroll position after prepending months (runs synchronously before paint)
-  useLayoutEffect(() => {
-    if (pendingScrollFix.current !== null) {
-      const container = scrollRef.current;
-      if (container) {
-        const prevHeight = pendingScrollFix.current;
-        container.scrollTop += container.scrollHeight - prevHeight;
-      }
-      pendingScrollFix.current = null;
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container) return;
+    // Use a top-anchored rootMargin so the "active" month is the one
+    // sitting at the top third of the viewport (matches Apple Calendar feel).
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const key = /** @type {HTMLElement} */ (entry.target).dataset
+            .monthKey;
+          if (!key) continue;
+          if (entry.isIntersecting) {
+            monthVisibilityRef.current.set(key, entry.intersectionRatio);
+          } else {
+            monthVisibilityRef.current.delete(key);
+          }
+        }
+        // Pick the most-visible month and update label if changed.
+        let bestKey = null;
+        let bestRatio = -1;
+        for (const [k, r] of monthVisibilityRef.current.entries()) {
+          if (r > bestRatio) {
+            bestRatio = r;
+            bestKey = k;
+          }
+        }
+        if (bestKey) {
+          const [year, month] = bestKey.split("-").map(Number);
+          const label = format(new Date(year, month - 1, 1), "MMMM yyyy");
+          if (label !== visibleMonthRef.current) {
+            visibleMonthRef.current = label;
+            onVisibleMonthChange(label);
+          }
+        }
+      },
+      {
+        root: container,
+        // Negative bottom margin biases selection toward the top of the
+        // viewport so the header label updates as a month *leaves* upward.
+        rootMargin: "0px 0px -60% 0px",
+        threshold: [0, 0.1, 0.25, 0.5, 0.75, 1],
+      },
+    );
+
+    // Observe every currently-rendered month
+    for (const el of Object.values(monthRefs.current)) {
+      if (el) observer.observe(el);
     }
-  }, [beforeCount]);
+    // Re-observe whenever months change (months prop dep below)
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [months, onVisibleMonthChange]);
+
+  // ── Edge-triggered range expansion ─────────────────────────────
+  // Uses `flushSync` so the scrollTop correction (after prepending months)
+  // happens in the *same* task as the React commit. This eliminates the
+  // momentum-scroll "jump back" that occurs when the correction is deferred
+  // to a post-paint useLayoutEffect.
+  const expandingRef = useRef(false);
 
   const handleScroll = useCallback(() => {
     const container = scrollRef.current;
     if (!container) return;
+    if (expandingRef.current) return;
+    if (performance.now() < suppressEdgeUntilRef.current) return;
 
-    // --- Infinite scroll: expand when near edges (cheap, do every event) ---
     const { scrollTop, scrollHeight, clientHeight } = container;
-    if (scrollHeight - scrollTop - clientHeight < EDGE_PX) {
+
+    // ── Append below ─────────────────────────────────────────────
+    if (
+      scrollHeight - scrollTop - clientHeight < EDGE_PX &&
+      afterCount < MAX_MONTHS
+    ) {
+      expandingRef.current = true;
       setAfterCount((c) => Math.min(c + LOAD_MORE, MAX_MONTHS));
+      // Append doesn't shift visible content; release guard next frame.
+      requestAnimationFrame(() => {
+        expandingRef.current = false;
+      });
+      return;
     }
-    if (scrollTop < EDGE_PX && pendingScrollFix.current === null) {
-      pendingScrollFix.current = scrollHeight;
-      setBeforeCount((c) => Math.min(c + LOAD_MORE, MAX_MONTHS));
+
+    // ── Prepend above (must preserve visual position) ────────────
+    if (scrollTop < EDGE_PX && beforeCount < MAX_MONTHS) {
+      expandingRef.current = true;
+      const prevHeight = scrollHeight;
+      const prevScrollTop = scrollTop;
+      // flushSync commits the new months synchronously so we can read
+      // the new scrollHeight and correct scrollTop *before* the browser
+      // paints the next frame — no flicker, no momentum jump.
+      flushSync(() => {
+        setBeforeCount((c) => Math.min(c + LOAD_MORE, MAX_MONTHS));
+      });
+      const newHeight = container.scrollHeight;
+      container.scrollTop = prevScrollTop + (newHeight - prevHeight);
+      // Release on next frame so we don't immediately re-trigger.
+      requestAnimationFrame(() => {
+        expandingRef.current = false;
+      });
     }
-
-    // --- Visible-month label update (expensive: getBoundingClientRect on
-    // every month element). Throttle via requestAnimationFrame so it runs at
-    // most once per frame, regardless of how fast the user scrolls.
-    if (rafPending.current) return;
-    rafPending.current = true;
-    requestAnimationFrame(() => {
-      rafPending.current = false;
-      const c2 = scrollRef.current;
-      if (!c2) return;
-      const containerTop = c2.getBoundingClientRect().top;
-      const containerMid = containerTop + c2.clientHeight * 0.35;
-
-      let closestMonth = null;
-      let closestDist = Infinity;
-      for (const [key, el] of Object.entries(monthRefs.current)) {
-        if (!el) continue;
-        const rect = el.getBoundingClientRect();
-        // Quick reject: skip elements entirely above/below the viewport
-        if (rect.bottom < containerTop - 200) continue;
-        if (rect.top > containerTop + c2.clientHeight + 200) continue;
-        const dist = Math.abs(rect.top + rect.height / 2 - containerMid);
-        if (dist < closestDist) {
-          closestDist = dist;
-          closestMonth = key;
-        }
-      }
-
-      if (closestMonth) {
-        const [year, month] = closestMonth.split("-").map(Number);
-        const label = format(new Date(year, month - 1, 1), "MMMM yyyy");
-        if (label !== visibleMonthRef.current) {
-          visibleMonthRef.current = label;
-          onVisibleMonthChange(label);
-        }
-      }
-    });
-  }, [onVisibleMonthChange]);
+  }, [afterCount, beforeCount, scrollRef]);
 
   // Attach scroll listener to the shared scroll container (passive for perf)
   useEffect(() => {
@@ -1343,7 +1381,7 @@ function MonthView({
   }, [beforeCount, afterCount, onRangeExpand]);
 
   return (
-    <div>
+    <div style={{ overflowAnchor: "auto" }}>
       {months.map((monthDate) => {
         const mKey = format(monthDate, "yyyy-MM");
         const mStart = startOfMonth(monthDate);
@@ -1356,6 +1394,7 @@ function MonthView({
           <div
             key={mKey}
             ref={(el) => (monthRefs.current[mKey] = el)}
+            data-month-key={mKey}
             className="calendar-month-block"
           >
             {/* Month label */}
