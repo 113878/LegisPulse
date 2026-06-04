@@ -565,6 +565,9 @@ export function extractCommitteeFromLastAction(lastAction) {
   const lower = name.toLowerCase();
   if (lower === "senate" || lower === "house" || lower === "governor") return null;
   return name || null;
+}
+
+/**
  * Fetch text for the most recent N bill versions (for AI version-diff).
  * Returns an array sorted newest-first:
  *   [{ doc_id, date, type, type_id, text }]
