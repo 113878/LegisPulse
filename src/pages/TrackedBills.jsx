@@ -101,6 +101,22 @@ export default function TrackedBills() {
     queryFn: () => api.entities.Bill.list(),
   });
 
+  const { data: allTeamBillNumbers = [] } = useQuery({
+    queryKey: ["allTeamBillNumbers"],
+    queryFn: () => api.entities.Team.getAllTeamBillNumbers(),
+    staleTime: 0,
+    refetchInterval: 15000,
+    refetchOnWindowFocus: true,
+  });
+
+  // Fetch shared bill data from teammates via RPC
+  const { data: sharedBillData = [] } = useQuery({
+    queryKey: ["sharedTeamBillData", "all", allTeamBillNumbers],
+    queryFn: () => api.entities.Team.getSharedTeamBillData(allTeamBillNumbers),
+    enabled: allTeamBillNumbers.length > 0,
+    staleTime: 0,
+  });
+
   const { data: personalMeta = {} } = useQuery({
     queryKey: ["personalBillMeta"],
     queryFn: () => api.entities.UserBillMeta.getAll(),
@@ -124,14 +140,29 @@ export default function TrackedBills() {
   });
 
   const trackedBillIds = userData?.tracked_bill_ids ?? [];
-  const trackedBills = allBills.filter((bill) =>
-    trackedBillIds.includes(bill.bill_number),
+  const effectiveTrackedBillNumbers = useMemo(
+    () => [
+      ...new Set([...(trackedBillIds ?? []), ...(allTeamBillNumbers ?? [])]),
+    ],
+    [trackedBillIds, allTeamBillNumbers],
+  );
+
+  // Merge local user's bills with shared teammate bill data.
+  const mergedBills = useMemo(() => {
+    const byNumber = new Map();
+    for (const b of sharedBillData) byNumber.set(b.bill_number, b);
+    for (const b of allBills) byNumber.set(b.bill_number, b);
+    return [...byNumber.values()];
+  }, [allBills, sharedBillData]);
+
+  const trackedBills = mergedBills.filter((bill) =>
+    effectiveTrackedBillNumbers.includes(bill.bill_number),
   );
 
   // Mark unseen LC changes as seen for personal tracked bills when the page loads
   useEffect(() => {
-    if (!trackedBillIds.length) return;
-    const unseenPersonal = trackedBillIds.filter((bn) => {
+    if (!effectiveTrackedBillNumbers.length) return;
+    const unseenPersonal = effectiveTrackedBillNumbers.filter((bn) => {
       const t = lcTrackingMap[bn];
       return (
         t && t.previous_lc && t.previous_lc !== t.current_lc && !t.change_seen
@@ -146,7 +177,7 @@ export default function TrackedBills() {
           /* non-critical */
         });
     }
-  }, [trackedBillIds, lcTrackingMap]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [effectiveTrackedBillNumbers, lcTrackingMap]);
 
   // ── Toggle tracking ────────────────────────────────────────────────────────
   const trackMutation = useMutation({
