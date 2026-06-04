@@ -565,6 +565,76 @@ export function extractCommitteeFromLastAction(lastAction) {
   const lower = name.toLowerCase();
   if (lower === "senate" || lower === "house" || lower === "governor") return null;
   return name || null;
+ * Fetch text for the most recent N bill versions (for AI version-diff).
+ * Returns an array sorted newest-first:
+ *   [{ doc_id, date, type, type_id, text }]
+ * Each `text` is extracted (html→text or pdf→text) and trimmed to maxLen.
+ * Versions that cannot yield usable text are skipped.
+ */
+export async function fetchBillTextVersionsForAI(
+  legiscanBillId,
+  count = 2,
+  maxLen = 18000,
+) {
+  if (!legiscanBillId) return [];
+
+  const data = await legiscanRequest("getBill", { id: legiscanBillId });
+  const bill = data.bill || {};
+  const texts = Array.isArray(bill.texts) ? [...bill.texts] : [];
+
+  texts.sort((a, b) => {
+    const dateA = new Date(a?.date || 0).getTime() || 0;
+    const dateB = new Date(b?.date || 0).getTime() || 0;
+    return dateB - dateA;
+  });
+
+  const results = [];
+  // Try up to count*2 versions so we still find `count` usable ones if some fail.
+  const maxAttempts = Math.max(count * 2, count + 2);
+  let attempts = 0;
+
+  for (const textItem of texts) {
+    if (results.length >= count || attempts >= maxAttempts) break;
+    const docId = textItem?.doc_id || textItem?.text_id || textItem?.id;
+    if (!docId) continue;
+    attempts += 1;
+
+    let extracted = "";
+    let textResponse = null;
+    try {
+      textResponse = await legiscanRequest("getBillText", { id: docId });
+      extracted = extractTextFromBillTextPayload(textResponse?.text) || "";
+
+      if (extracted.length < 300) {
+        const pdfBytes = extractPdfBytesFromBillTextPayload(textResponse?.text);
+        textResponse = null;
+        if (pdfBytes?.length) {
+          const pdfText = await extractTextFromPdfBytes(pdfBytes);
+          if (pdfText && pdfText.length > extracted.length) {
+            extracted = pdfText;
+          }
+        }
+      } else {
+        textResponse = null;
+      }
+    } catch (error) {
+      textResponse = null;
+      console.warn(`getBillText failed for version doc ${docId}:`, error);
+      continue;
+    }
+
+    if (!extracted || extracted.length < 300) continue;
+
+    results.push({
+      doc_id: docId,
+      date: textItem?.date || null,
+      type: textItem?.type || null,
+      type_id: textItem?.type_id || null,
+      text: extracted.slice(0, maxLen),
+    });
+  }
+
+  return results;
 }
 
 /**

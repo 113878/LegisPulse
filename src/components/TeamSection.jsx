@@ -63,6 +63,7 @@ import BillCard from "@/components/bills/BillCard";
 import BillDetailsModal from "@/components/bills/BillDetailsModal";
 import TeamChat from "@/components/TeamChat";
 import { useResizableHeight, ResizeHandle } from "@/hooks/use-resizable-height";
+import { supabase } from "@/lib/supabase";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const TEAM_COLORS = [
@@ -269,11 +270,26 @@ export default function TeamSection({ team, onLeave, defaultOpen = true }) {
     queryKey: ["teamBills", teamId],
     queryFn: () => api.entities.Team.getBillNumbers(teamId),
     enabled: !!teamId,
+    // staleTime: 0 ensures this always re-fetches on mount, overriding the
+    // global 5-minute staleTime that would otherwise serve a stale empty
+    // array cached from before any bills were added.
+    staleTime: 0,
+    refetchInterval: 15000,
+    refetchOnWindowFocus: true,
   });
 
   const { data: allBills = [] } = useQuery({
     queryKey: ["bills"],
     queryFn: () => api.entities.Bill.list(),
+  });
+
+  // Fetch shared bill data from teammates via RPC so we can see
+  // bill rows that belong to other team members.
+  const { data: sharedBillData = [] } = useQuery({
+    queryKey: ["sharedTeamBillData", teamId, teamBillNumbers],
+    queryFn: () => api.entities.Team.getSharedTeamBillData(teamBillNumbers),
+    enabled: teamBillNumbers.length > 0,
+    staleTime: 0,
   });
 
   const { data: userData } = useQuery({
@@ -287,6 +303,36 @@ export default function TeamSection({ team, onLeave, defaultOpen = true }) {
     enabled: !!teamId,
   });
 
+  // Keep team bill views in sync across teammates in real time.
+  useEffect(() => {
+    if (!teamId) return;
+    const channel = supabase
+      .channel(`team-bills-live-${teamId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "team_bills",
+          filter: `team_id=eq.${teamId}`,
+        },
+        () => {
+          queryClient.invalidateQueries({ queryKey: ["teamBills", teamId] });
+          queryClient.invalidateQueries({ queryKey: ["teamBillMeta", teamId] });
+          queryClient.invalidateQueries({ queryKey: ["allTeamBills"] });
+          queryClient.invalidateQueries({ queryKey: ["allTeamBillNumbers"] });
+          queryClient.invalidateQueries({
+            queryKey: ["sharedTeamBillData", teamId],
+          });
+        },
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [teamId, queryClient]);
+
   // ── LC Tracking data ───────────────────────────────────────────────────────
   const { data: lcTrackingMap = {} } = useQuery({
     queryKey: ["lcTracking"],
@@ -294,7 +340,19 @@ export default function TeamSection({ team, onLeave, defaultOpen = true }) {
   });
 
   const trackedBillIds = userData?.tracked_bill_ids ?? [];
-  const teamBills = allBills.filter((b) =>
+
+  // Merge local user's bills with shared teammate bill data.
+  // Local copies take priority (user's own data is preferred).
+  const mergedBills = useMemo(() => {
+    const byNumber = new Map();
+    // Shared data first (can be overwritten by local)
+    for (const b of sharedBillData) byNumber.set(b.bill_number, b);
+    // Local user bills overwrite shared copies
+    for (const b of allBills) byNumber.set(b.bill_number, b);
+    return [...byNumber.values()];
+  }, [allBills, sharedBillData]);
+
+  const teamBills = mergedBills.filter((b) =>
     teamBillNumbers.includes(b.bill_number),
   );
   const activeMembers = members.filter((m) => m.status === "active");
@@ -470,8 +528,11 @@ export default function TeamSection({ team, onLeave, defaultOpen = true }) {
     },
     onError: (_e, _b, ctx) =>
       queryClient.setQueryData(["teamBills", teamId], ctx.prev),
-    onSettled: () =>
-      queryClient.invalidateQueries({ queryKey: ["teamBills", teamId] }),
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["teamBills", teamId] });
+      queryClient.invalidateQueries({ queryKey: ["allTeamBillNumbers"] });
+      queryClient.invalidateQueries({ queryKey: ["allTeamBills"] });
+    },
   });
 
   // ── Leave team ─────────────────────────────────────────────────────────────

@@ -123,6 +123,8 @@ export default function Layout({
     queryFn: () => api.entities.Team.getAllTeamBillNumbers(),
     enabled: !!user,
     staleTime: 60000,
+    refetchInterval: 15000,
+    refetchOnWindowFocus: true,
   });
 
   // Compute personal vs team unseen LC counts
@@ -167,27 +169,29 @@ export default function Layout({
     <SidebarProvider>
       <div className="h-screen flex w-full bg-slate-50 overflow-hidden">
         <Sidebar className="border-r border-slate-200 bg-white">
-          <SidebarHeader className="border-b border-slate-200 p-4">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-gradient-to-br from-blue-600 to-blue-700 rounded-lg flex items-center justify-center shadow-sm">
-                <Building2 className="w-6 h-6 text-white" />
+          <SidebarHeader className="border-b border-slate-200 p-3">
+            <div className="flex items-center gap-2.5">
+              <div className="w-9 h-9 bg-gradient-to-br from-blue-600 to-blue-700 rounded-lg flex items-center justify-center shadow-sm shrink-0">
+                <Building2 className="w-5 h-5 text-white" />
               </div>
-              <div>
-                <h2 className="font-bold text-slate-900 text-lg">LegisPulse</h2>
-                <p className="text-xs text-slate-500 font-medium">
+              <div className="min-w-0">
+                <h2 className="font-bold text-slate-900 text-base leading-tight">
+                  LegisPulse
+                </h2>
+                <p className="text-[11px] text-slate-500 font-medium leading-tight">
                   Georgia Legislature
                 </p>
               </div>
             </div>
           </SidebarHeader>
 
-          <SidebarContent className="p-4">
-            <SidebarGroup>
-              <SidebarGroupLabel className="text-xs font-semibold text-slate-500 uppercase tracking-wider px-2 py-2">
+          <SidebarContent className="px-3 py-2 overflow-hidden">
+            <SidebarGroup className="p-0">
+              <SidebarGroupLabel className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider px-2 py-1">
                 Navigation
               </SidebarGroupLabel>
               <SidebarGroupContent>
-                <SidebarMenu className="space-y-1">
+                <SidebarMenu className="space-y-0.5">
                   {navigationItems.map((item) => (
                     <SidebarMenuItem key={item.title}>
                       <SidebarMenuButton
@@ -200,9 +204,9 @@ export default function Layout({
                       >
                         <Link
                           to={item.url}
-                          className="flex items-center gap-3 px-3 py-2"
+                          className="flex items-center gap-3 px-3 py-1.5"
                         >
-                          <item.icon className="w-5 h-5" />
+                          <item.icon className="w-[18px] h-[18px]" />
                           <span className="font-semibold text-sm flex-1">
                             {item.title}
                           </span>
@@ -227,17 +231,20 @@ export default function Layout({
               </SidebarGroupContent>
             </SidebarGroup>
 
-            <SidebarGroup className="mt-4">
-              <SidebarGroupLabel className="text-xs font-semibold text-slate-500 uppercase tracking-wider px-2 py-2">
+            <SidebarGroup className="mt-3 p-0">
+              <SidebarGroupLabel className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider px-2 py-1">
                 Quick Stats
               </SidebarGroupLabel>
               <SidebarGroupContent>
-                <div className="px-3 space-y-3">
+                <div className="px-3 space-y-1.5">
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-slate-600 font-medium">
                       Session 2025-2026
                     </span>
-                    <Badge variant="outline" className="text-xs">
+                    <Badge
+                      variant="outline"
+                      className="text-[10px] px-1.5 py-0"
+                    >
                       Active
                     </Badge>
                   </div>
@@ -258,7 +265,7 @@ export default function Layout({
             </SidebarGroup>
           </SidebarContent>
 
-          <SidebarFooter className="border-t border-slate-200 p-4">
+          <SidebarFooter className="border-t border-slate-200 p-3">
             <div className="flex items-center gap-2">
               <button
                 onClick={() => navigate(createPageUrl("Settings"))}

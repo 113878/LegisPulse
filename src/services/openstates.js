@@ -164,6 +164,7 @@ function normalizeEvent(ev) {
             identifier: rel.bill.identifier ?? rel.name ?? "Unknown",
             title: rel.bill.title ?? "",
             session: rel.bill.session ?? "",
+            openstates_url: rel.bill.openstates_url ?? "",
             note: item.description ?? "",
           });
         }
@@ -186,6 +187,24 @@ function normalizeEvent(ev) {
     url: l.url,
     note: l.note ?? "",
   }));
+
+  // Check if Open States already provided a link to a *specific* video
+  // (not a generic channel/streams page).
+  const videoLink = links.find((l) => {
+    const u = (l.url ?? "").toLowerCase();
+    const n = (l.note ?? "").toLowerCase();
+    const isVideoRelated =
+      u.includes("vimeo.com/") ||
+      u.includes("youtube.com/watch") ||
+      u.includes("youtu.be/") ||
+      n.includes("video");
+    // Exclude generic channel/streams pages — we build better URLs ourselves
+    const isGenericChannel =
+      u.includes("/streams") ||
+      u.includes("/@") ||
+      u.match(/youtube\.com\/(channel|c|user)\//);
+    return isVideoRelated && !isGenericChannel;
+  });
 
   // Build start/end times
   const startTime = ev.start_date || new Date().toISOString();
@@ -210,6 +229,49 @@ function normalizeEvent(ev) {
       ? "leg-house"
       : "gold";
 
+  // Derive video link — build a channel-specific YouTube search URL
+  // that targets the exact committee name + date for the event.
+  let videoUrl = videoLink ? videoLink.url : null;
+  if (!videoUrl) {
+    const channel = nameLower.startsWith("senate")
+      ? "@GeorgiaStateSenate"
+      : nameLower.startsWith("house")
+        ? "@georgiahouseofreps"
+        : null;
+    if (channel) {
+      // Extract committee name: strip "Senate " or "House " prefix
+      const committeeName = (ev.name ?? "")
+        .replace(/^(Senate|House)\s+/i, "")
+        .trim();
+      // Format the date portion for the search query
+      let dateQuery = "";
+      try {
+        const d = new Date(startTime);
+        if (!isNaN(d.getTime())) {
+          const months = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+          ];
+          dateQuery = `${months[d.getMonth()]} ${d.getDate()} ${d.getFullYear()}`;
+        }
+      } catch {
+        // ignore
+      }
+      const query = [committeeName, dateQuery].filter(Boolean).join(" ");
+      videoUrl = `https://www.youtube.com/${channel}/search?query=${encodeURIComponent(query)}`;
+    }
+  }
+
   return {
     // Core fields — compatible with our calendar event shape
     id: ev.id,
@@ -227,8 +289,243 @@ function normalizeEvent(ev) {
     bills,
     participants,
     links,
+    videoUrl,
+    scheduleUrl: "https://www.legis.ga.gov/schedule/all",
 
     // Marker
     _source: "openstates",
   };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Committee-related API functions
+// ═══════════════════════════════════════════════════════════════
+
+const GRAPHQL_URL = "/api/openstates-graphql";
+
+/**
+ * Execute a GraphQL query against the Open States GraphQL API.
+ * Uses the same API key as the REST API.
+ */
+async function graphql(query, variables = {}) {
+  if (!API_KEY) return null;
+
+  const res = await fetch(GRAPHQL_URL, {
+    method: "POST",
+    headers: {
+      "X-API-KEY": API_KEY,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Open States GraphQL ${res.status}: ${text.slice(0, 300)}`);
+  }
+
+  const json = await res.json();
+  if (json.errors?.length) {
+    throw new Error(`Open States GraphQL error: ${json.errors[0].message}`);
+  }
+  return json.data;
+}
+
+/**
+ * Fetch all committees (organizations) for a given chamber via GraphQL.
+ * @param {"upper"|"lower"} chamber  "upper" = Senate, "lower" = House
+ * @returns {Promise<Array<{id:string, name:string, chamber:string, parent:string|null}>>}
+ */
+export async function fetchGACommittees(chamber) {
+  if (!API_KEY) return [];
+
+  const chamberLabel = chamber === "upper" ? "Senate" : "House";
+
+  const query = `
+    {
+      jurisdiction(name: "Georgia") {
+        organizations(classification: "committee", first: 100) {
+          edges {
+            node {
+              id
+              name
+              classification
+              parent {
+                name
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    const data = await graphql(query);
+    const orgs = data?.jurisdiction?.organizations?.edges ?? [];
+
+    return orgs
+      .map((e) => e.node)
+      .filter((org) => {
+        // Filter by chamber based on parent org name
+        const parent = (org.parent?.name ?? "").toLowerCase();
+        if (chamber === "upper") return parent.includes("senate");
+        if (chamber === "lower") return parent.includes("house");
+        return true;
+      })
+      .map((org) => ({
+        id: org.id,
+        name: org.name,
+        chamber: chamberLabel,
+        parent: org.parent?.name ?? null,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch (err) {
+    console.warn("Open States committees fetch failed:", err.message);
+    return [];
+  }
+}
+
+/**
+ * Fetch bills associated with a committee via GraphQL.
+ * Uses searchQuery to find candidates, then verifies each bill has the
+ * committee in its action relatedEntities (referral, committee-passage, etc.).
+ * @param {string} committeeName
+ * @param {"upper"|"lower"} chamber
+ * @returns {Promise<Array>}
+ */
+export async function fetchBillsByCommittee(committeeName, chamber) {
+  if (!API_KEY) return [];
+
+  const chamberParam = chamber === "upper" ? "upper" : "lower";
+  const committeeNameLower = committeeName.toLowerCase();
+
+  // Use GraphQL to search for candidate bills and pull relatedEntities
+  // to verify committee assignment
+  let allBills = [];
+  let cursor = null;
+  const PAGE_SIZE = 100;
+  const MAX_PAGES = 5;
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const afterClause = cursor ? `, after: "${cursor}"` : "";
+    const query = `{
+      bills(
+        jurisdiction: "Georgia",
+        chamber: "${chamberParam}",
+        searchQuery: "${committeeName.replace(/"/g, '\\"')}",
+        first: ${PAGE_SIZE}${afterClause}
+      ) {
+        edges {
+          cursor
+          node {
+            id
+            identifier
+            title
+            openstatesUrl
+            abstracts { abstract }
+            sponsorships { name classification primary }
+            actions {
+              description
+              date
+              classification
+              organization { name classification }
+              relatedEntities { name entityType }
+            }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }`;
+
+    let data;
+    try {
+      data = await graphql(query);
+    } catch (err) {
+      console.warn("GraphQL bills-by-committee fetch failed:", err.message);
+      break;
+    }
+
+    const edges = data?.bills?.edges ?? [];
+    if (edges.length === 0) break;
+
+    allBills.push(...edges.map((e) => e.node));
+
+    if (!data.bills.pageInfo.hasNextPage) break;
+    cursor = data.bills.pageInfo.endCursor;
+  }
+
+  // Filter to bills that actually reference this committee in action relatedEntities
+  const verifiedBills = allBills.filter((bill) =>
+    (bill.actions ?? []).some((action) =>
+      (action.relatedEntities ?? []).some(
+        (re) =>
+          re.entityType === "organization" &&
+          re.name.toLowerCase() === committeeNameLower,
+      ),
+    ),
+  );
+
+  // Normalize bills
+  return verifiedBills.map((bill) => {
+    const actions = (bill.actions ?? []).map((a) => ({
+      description: a.description,
+      date: a.date,
+      classification: a.classification,
+      chamber: a.organization?.classification ?? "",
+      organization: a.organization?.name ?? "",
+      relatedEntities: a.relatedEntities ?? [],
+    }));
+
+    // Committee-relevant actions (referral, passage, etc.)
+    const committeeActions = actions.filter((a) =>
+      (a.relatedEntities ?? []).some(
+        (re) =>
+          re.entityType === "organization" &&
+          re.name.toLowerCase() === committeeNameLower,
+      ),
+    );
+
+    // Determine if the bill's LAST committee-related action is for THIS committee
+    const lastCommitteeAction = [...actions]
+      .reverse()
+      .find((a) =>
+        (a.relatedEntities ?? []).some(
+          (re) => re.entityType === "organization",
+        ),
+      );
+    const isCurrentlyAssigned =
+      lastCommitteeAction &&
+      (lastCommitteeAction.relatedEntities ?? []).some(
+        (re) =>
+          re.entityType === "organization" &&
+          re.name.toLowerCase() === committeeNameLower,
+      );
+
+    const sponsors = (bill.sponsorships ?? []).map((s) => ({
+      name: s.name,
+      role:
+        s.classification === "primary" || s.primary ? "primary" : "cosponsor",
+      party: s.party ?? "",
+    }));
+
+    const lastAction = actions[actions.length - 1];
+
+    return {
+      id: bill.id,
+      identifier: bill.identifier,
+      title: bill.title,
+      session: "",
+      chamber: chamberParam === "upper" ? "Senate" : "House",
+      openstates_url: bill.openstatesUrl ?? "",
+      latest_action: lastAction?.description ?? "",
+      latest_action_date: lastAction?.date ?? "",
+      actions,
+      committeeActions,
+      isCurrentlyAssigned: !!isCurrentlyAssigned,
+      sponsors,
+      abstract: bill.abstracts?.[0]?.abstract ?? "",
+    };
+  });
 }
