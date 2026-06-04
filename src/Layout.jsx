@@ -61,7 +61,7 @@ const navigationItems = [
     title: "Committees",
     url: createPageUrl("Committees"),
     icon: Landmark,
-    description: "Browse by Committee",
+    description: "GA House & Senate Committees",
   },
   {
     title: "Twitter Feed",
