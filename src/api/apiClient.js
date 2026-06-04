@@ -363,6 +363,32 @@ export const api = {
             .eq("bill_number", bill_number);
         }
       },
+
+      /**
+       * Bulk update current_committee and history for bills identified by legiscan_id.
+       * Called after the detailed enrichment pass (enrichBillsWithDetails) completes.
+       * Runs batches of concurrent Supabase updates to avoid overloading the connection.
+       *
+       * @param {Array<{legiscan_id: number|string, current_committee: string|null, history: Array}>} updates
+       */
+      async bulkUpdateCommitteeData(updates) {
+        if (!updates.length) return;
+        const userId = await getUserId();
+        const CONCURRENCY = 10;
+
+        for (let i = 0; i < updates.length; i += CONCURRENCY) {
+          const chunk = updates.slice(i, i + CONCURRENCY);
+          await Promise.allSettled(
+            chunk.map(({ legiscan_id, current_committee, history }) =>
+              supabase
+                .from("bills")
+                .update({ current_committee, history })
+                .eq("user_id", userId)
+                .eq("legiscan_id", String(legiscan_id)),
+            ),
+          );
+        }
+      },
     },
 
     EmailList: {

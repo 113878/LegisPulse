@@ -15,6 +15,21 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 // ── Helpers ───────────────────────────────────────────────────
 
+// Extracts a committee name from a single action string (bill history entry).
+// Matches patterns like "Referred to Finance Committee" or
+// "Assigned to Health & Human Services Committee".
+function extractCommitteeFromAction(text) {
+  if (!text) return null;
+  const match = text.match(
+    /(?:assigned to|referred to|re-referred to|recommitted to)\s+(.+?)(?:\s*[.,;]|$)/i,
+  );
+  if (!match) return null;
+  const name = match[1].trim();
+  const lower = name.toLowerCase();
+  if (lower === "senate" || lower === "house" || lower === "governor") return null;
+  return name || null;
+}
+
 function normalizeChamber(raw) {
   const s = (raw ?? "").toLowerCase();
   if (s === "h" || s === "house" || s === "lower") return "House";
@@ -217,19 +232,39 @@ export default function Committees() {
   });
 
   // ── Build committee index ─────────────────────────────────
-  // Pass 1: collect unique committee names per chamber from current_committee
-  // Pass 2: count current assignments and all related bills (history scan)
+  // Pass 1: discover every committee this session touched.
+  //   - current_committee  → bill is currently assigned there
+  //   - bill.history entries → bill was referred/assigned there in the past
+  //     (needed because once a bill passes committee its current_committee
+  //      becomes null, but history still records the referral action)
+  // Pass 2: count current vs. all-time bills per committee.
   const { houseCommittees, senateCommittees } = useMemo(() => {
     const house = new Map(); // name → { currentCount, allCount }
     const senate = new Map();
+
+    const register = (map, name) => {
+      const key = name.trim();
+      if (key && !map.has(key)) map.set(key, { currentCount: 0, allCount: 0 });
+    };
 
     for (const bill of bills) {
       const ch = normalizeChamber(bill.chamber);
       if (!ch) continue;
       const map = ch === "House" ? house : senate;
-      const comm = bill.current_committee?.trim();
-      if (comm && !map.has(comm)) {
-        map.set(comm, { currentCount: 0, allCount: 0 });
+
+      // From current assignment
+      if (bill.current_committee?.trim()) {
+        register(map, bill.current_committee);
+      }
+
+      // From every history action — finds committees bills have already left
+      if (Array.isArray(bill.history)) {
+        for (const entry of bill.history) {
+          const actionText =
+            entry.action ?? entry.description ?? entry.text ?? "";
+          const name = extractCommitteeFromAction(actionText);
+          if (name) register(map, name);
+        }
       }
     }
 
